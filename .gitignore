@@ -1,0 +1,18 @@
+.DS_Store
+.build/
+.swiftpm/
+Package.resolved
+
+# Built app artifacts (use GitHub Releases for binaries)
+dist/*.app
+dist/*.zip
+
+# Xcode/IDE
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+
+# Local environment / settings
+.claude/
+.vscode/
+.idea/
