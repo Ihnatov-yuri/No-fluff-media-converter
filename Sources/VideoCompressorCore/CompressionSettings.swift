@@ -229,6 +229,17 @@ public enum AudioBitrate: Int, CaseIterable, Codable, Identifiable, Sendable {
     public var ffmpegValue: String { "\(rawValue)k" }
 }
 
+public enum SilenceSpeed: Int, CaseIterable, Codable, Identifiable, Sendable {
+    case x2 = 2
+    case x3 = 3
+    case x4 = 4
+    case x8 = 8
+
+    public var id: Int { rawValue }
+    public var displayName: String { "\(rawValue)x" }
+    public var multiplier: Double { Double(rawValue) }
+}
+
 public struct CompressionSettings: Equatable, Codable, Sendable {
     public var mode: CompressionMode
     public var qualityPreset: QualityPreset
@@ -236,6 +247,8 @@ public struct CompressionSettings: Equatable, Codable, Sendable {
     public var resolutionCap: ResolutionCap
     public var audioBitrate: AudioBitrate
     public var outputPreset: OutputPreset
+    public var speedUpSilence: Bool
+    public var silenceSpeed: SilenceSpeed
 
     public init(
         mode: CompressionMode = .quality,
@@ -243,7 +256,9 @@ public struct CompressionSettings: Equatable, Codable, Sendable {
         targetSizeMB: Double = 50,
         resolutionCap: ResolutionCap = .original,
         audioBitrate: AudioBitrate = .kbps192,
-        outputPreset: OutputPreset = .mp4H264
+        outputPreset: OutputPreset = .mp4H264,
+        speedUpSilence: Bool = false,
+        silenceSpeed: SilenceSpeed = .x2
     ) {
         self.mode = mode
         self.qualityPreset = qualityPreset
@@ -251,6 +266,8 @@ public struct CompressionSettings: Equatable, Codable, Sendable {
         self.resolutionCap = resolutionCap
         self.audioBitrate = audioBitrate
         self.outputPreset = outputPreset
+        self.speedUpSilence = speedUpSilence
+        self.silenceSpeed = silenceSpeed
     }
 
     public static let defaults = CompressionSettings()

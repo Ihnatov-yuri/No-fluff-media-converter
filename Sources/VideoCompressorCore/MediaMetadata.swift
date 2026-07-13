@@ -9,6 +9,7 @@ public struct MediaMetadata: Equatable, Sendable {
     public var height: Int?
     public var pixelFormat: String?
     public var formatName: String?
+    public var frameRate: Double?
 
     public init(
         duration: Double,
@@ -18,7 +19,8 @@ public struct MediaMetadata: Equatable, Sendable {
         width: Int?,
         height: Int?,
         pixelFormat: String?,
-        formatName: String? = nil
+        formatName: String? = nil,
+        frameRate: Double? = nil
     ) {
         self.duration = duration
         self.videoCodec = videoCodec
@@ -28,5 +30,6 @@ public struct MediaMetadata: Equatable, Sendable {
         self.height = height
         self.pixelFormat = pixelFormat
         self.formatName = formatName
+        self.frameRate = frameRate
     }
 }
