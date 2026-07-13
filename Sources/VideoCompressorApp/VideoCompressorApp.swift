@@ -9,9 +9,11 @@ struct VideoCompressorApp: App {
         WindowGroup("Media Compressor") {
             ContentView()
                 .environmentObject(viewModel)
+                .tint(.brandOrange)
                 .frame(minWidth: 920, minHeight: 620)
                 .sheet(isPresented: $isAboutPresented) {
                     AboutView()
+                        .tint(.brandOrange)
                 }
         }
         .commands {
@@ -33,7 +35,7 @@ private struct AboutView: View {
             HStack(alignment: .center, spacing: 14) {
                 Image(systemName: "film.stack.fill")
                     .font(.system(size: 42, weight: .regular))
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(Color.brandOrange)
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Media Compressor")
