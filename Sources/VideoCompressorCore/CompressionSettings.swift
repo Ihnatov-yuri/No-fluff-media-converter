@@ -229,15 +229,24 @@ public enum AudioBitrate: Int, CaseIterable, Codable, Identifiable, Sendable {
     public var ffmpegValue: String { "\(rawValue)k" }
 }
 
-public enum SilenceSpeed: Int, CaseIterable, Codable, Identifiable, Sendable {
+public enum SilenceSpeed: Double, CaseIterable, Codable, Identifiable, Sendable {
+    case x1_25 = 1.25
+    case x1_5 = 1.5
     case x2 = 2
     case x3 = 3
     case x4 = 4
     case x8 = 8
 
-    public var id: Int { rawValue }
-    public var displayName: String { "\(rawValue)x" }
-    public var multiplier: Double { Double(rawValue) }
+    public var id: Double { rawValue }
+
+    public var displayName: String {
+        if rawValue == rawValue.rounded() {
+            return "\(Int(rawValue))x"
+        }
+        return "\(rawValue.formatted(.number.precision(.fractionLength(0...2))))x"
+    }
+
+    public var multiplier: Double { rawValue }
 }
 
 public struct CompressionSettings: Equatable, Codable, Sendable {
