@@ -41,7 +41,7 @@ private struct AboutView: View {
                     Text("Media Compressor")
                         .font(.title2)
                         .fontWeight(.semibold)
-                    Text("Version 0.1.0")
+                    Text("Version 0.2.0")
                         .foregroundStyle(.secondary)
                 }
 
