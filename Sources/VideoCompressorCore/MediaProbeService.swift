@@ -60,7 +60,8 @@ public final class MediaProbeService: @unchecked Sendable {
             width: video?.width,
             height: video?.height,
             pixelFormat: video?.pixelFormat,
-            formatName: probeOutput.format?.formatName
+            formatName: probeOutput.format?.formatName,
+            frameRate: video?.frameRateValue
         )
     }
 }
@@ -77,10 +78,23 @@ private struct FFProbeStream: Decodable {
     var height: Int?
     var pixelFormat: String?
     var duration: String?
+    var frameRate: String?
 
     var durationValue: Double? {
         guard let duration else { return nil }
         return Double(duration)
+    }
+
+    var frameRateValue: Double? {
+        guard let frameRate else { return nil }
+        let parts = frameRate.split(separator: "/")
+        guard parts.count == 2,
+              let numerator = Double(parts[0]),
+              let denominator = Double(parts[1]),
+              denominator > 0, numerator > 0 else {
+            return nil
+        }
+        return numerator / denominator
     }
 
     enum CodingKeys: String, CodingKey {
@@ -90,6 +104,7 @@ private struct FFProbeStream: Decodable {
         case height
         case pixelFormat = "pix_fmt"
         case duration
+        case frameRate = "r_frame_rate"
     }
 }
 

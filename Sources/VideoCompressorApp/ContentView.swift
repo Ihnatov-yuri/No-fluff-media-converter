@@ -122,7 +122,7 @@ private struct SettingsBar: View {
                         Text(settings.outputPreset.isAudioOnly
                              ? settings.qualityPreset.detailText
                              : "\(settings.qualityPreset.detailText), CRF \(settings.crf)")
-                            .font(.caption)
+                            .font(.mono(.caption))
                             .foregroundStyle(.secondary)
                             .frame(width: 150, alignment: .leading)
                     }
@@ -163,8 +163,23 @@ private struct SettingsBar: View {
                 .frame(width: 150)
                 .help("Audio bitrate. Used as AAC for MP4/MOV outputs and as MP3 for MP3 outputs.")
 
+                Toggle("Speed up silence", isOn: $settings.speedUpSilence)
+                    .toggleStyle(.checkbox)
+                    .help("Plays quiet stretches longer than a second at higher speed while keeping speech at normal pace. Great for lectures, meetings, and screen recordings.")
+
+                if settings.speedUpSilence {
+                    Picker("Silence speed", selection: $settings.silenceSpeed) {
+                        ForEach(SilenceSpeed.allCases) { speed in
+                            Text(speed.displayName).tag(speed)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 66)
+                    .help("How fast the quiet parts play back.")
+                }
+
                 Text(settings.outputPreset.compatibilitySummary)
-                    .font(.caption)
+                    .font(.mono(.caption))
                     .foregroundStyle(settings.outputPreset.isBestWindowsChoice ? Color.green : Color.secondary)
 
                 Spacer()
@@ -188,7 +203,7 @@ private struct InfoStrip: View {
                 .foregroundStyle(.secondary)
             Spacer()
         }
-        .font(.caption)
+        .font(.mono(.caption))
         .padding(.horizontal, 16)
         .padding(.bottom, 10)
     }
@@ -204,7 +219,7 @@ private struct JobTable: View {
                     Text(job.inputURL.lastPathComponent)
                         .lineLimit(1)
                     Text(job.inputURL.deletingLastPathComponent().path)
-                        .font(.caption)
+                        .font(.mono(.caption))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -218,7 +233,7 @@ private struct JobTable: View {
 
             TableColumn("Media") { job in
                 Text(mediaSummary(job.metadata))
-                    .font(.caption)
+                    .font(.mono(.caption))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -226,7 +241,7 @@ private struct JobTable: View {
 
             TableColumn("Format") { job in
                 Text(formatLabel(for: job))
-                    .font(.caption)
+                    .font(.mono(.caption))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -245,6 +260,7 @@ private struct JobTable: View {
 
             TableColumn("Output") { job in
                 Text(job.outputURL.lastPathComponent)
+                    .font(.mono(.body))
                     .lineLimit(1)
                     .foregroundStyle(job.status == .completed ? .primary : .secondary)
             }
@@ -254,10 +270,13 @@ private struct JobTable: View {
     private func formatLabel(for job: CompressionJob) -> String {
         let resolved = job.appliedSettings ?? viewModel.settings.resolved(for: job.metadata)
         let preset = resolved.outputPreset
-        if preset.isAudioOnly {
-            return "\(preset.shortName) (\(resolved.audioBitrate.displayName))"
+        var label = preset.isAudioOnly
+            ? "\(preset.shortName) (\(resolved.audioBitrate.displayName))"
+            : preset.shortName
+        if resolved.speedUpSilence {
+            label += " · silence \(resolved.silenceSpeed.displayName)"
         }
-        return preset.shortName
+        return label
     }
 
     private func mediaSummary(_ metadata: MediaMetadata?) -> String {
@@ -289,7 +308,7 @@ private struct StatusLabel: View {
                 Text(job.status.displayName)
                 if let errorMessage = job.errorMessage, job.status == .failed || job.status == .cancelled {
                     Text(errorMessage)
-                        .font(.caption2)
+                        .font(.mono(.caption2))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -304,7 +323,7 @@ private struct StatusLabel: View {
         case .ready:
             return .secondary
         case .running:
-            return .accentColor
+            return .brandOrange
         case .completed:
             return .green
         case .failed:
@@ -322,7 +341,7 @@ private struct EmptyDropView: View {
         VStack(spacing: 12) {
             Image(systemName: "film.stack")
                 .font(.system(size: 46, weight: .regular))
-                .foregroundStyle(isTargeted ? Color.accentColor : Color.secondary)
+                .foregroundStyle(isTargeted ? Color.brandOrange : Color.secondary)
             Text("Drop media here")
                 .font(.title3)
                 .fontWeight(.semibold)
@@ -332,7 +351,7 @@ private struct EmptyDropView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(isTargeted ? Color.accentColor : Color.secondary.opacity(0.25), style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+                .strokeBorder(isTargeted ? Color.brandOrange : Color.secondary.opacity(0.25), style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
         )
     }
 }
@@ -605,6 +624,10 @@ private struct ComparisonView: View {
             MetricRow("Full Output", job.outputURL.path)
         ]
 
+        if settings.speedUpSilence {
+            rows.insert(MetricRow("Silence", "Quiet parts at \(settings.silenceSpeed.displayName)"), at: rows.count - 1)
+        }
+
         if job.previewStatus == .ready {
             rows.insert(MetricRow("Sample Size", byteString(job.previewSizeBytes)), at: 0)
             rows.insert(MetricRow("Sample Video", codecText(job.previewMetadata?.videoCodec)), at: 2)
@@ -619,15 +642,20 @@ private struct ComparisonView: View {
 
     private func afterOutputRows(for job: CompressionJob) -> [MetricRow] {
         let settings = comparisonSettings(for: job)
-        return [
+        var rows = [
             MetricRow("Size", byteString(job.outputSizeBytes)),
             MetricRow("Video", codecText(job.outputMetadata?.videoCodec)),
             MetricRow("Resolution", resolutionText(job.outputMetadata)),
             MetricRow("Audio", audioText(job.outputMetadata)),
+            MetricRow("Duration", durationText(job.outputMetadata?.duration)),
             MetricRow("Container", containerText(job.outputMetadata)),
             MetricRow("Preset", settings.outputPreset.displayName),
             MetricRow("Saved", job.outputURL.path)
         ]
+        if settings.speedUpSilence {
+            rows.insert(MetricRow("Silence", "Quiet parts at \(settings.silenceSpeed.displayName)"), at: 5)
+        }
+        return rows
     }
 
     private func qualityText(for job: CompressionJob) -> String {
@@ -840,14 +868,16 @@ private struct MetricsPanel: View {
                 ForEach(rows) { row in
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Text(row.label)
+                            .font(.mono(.caption))
+                            .textCase(.uppercase)
                             .foregroundStyle(.secondary)
                             .frame(width: 86, alignment: .leading)
 
                         Text(row.value)
+                            .font(.mono(.caption))
                             .lineLimit(2)
                             .textSelection(.enabled)
                     }
-                    .font(.caption)
                 }
             }
         }

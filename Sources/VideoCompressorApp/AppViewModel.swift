@@ -24,14 +24,8 @@ final class AppViewModel: ObservableObject {
     private var outputFrameGenerationJobIDs = Set<UUID>()
 
     init() {
-        self.ffmpegURL = BinaryLocator.resolve(
-            preferredPath: "/opt/homebrew/bin/ffmpeg",
-            executableName: "ffmpeg"
-        )
-        self.ffprobeURL = BinaryLocator.resolve(
-            preferredPath: "/opt/homebrew/bin/ffprobe",
-            executableName: "ffprobe"
-        )
+        self.ffmpegURL = BinaryLocator.resolve(executableName: "ffmpeg")
+        self.ffprobeURL = BinaryLocator.resolve(executableName: "ffprobe")
 
         if ffmpegURL == nil {
             appError = CompressionError.missingBinary("ffmpeg").localizedDescription
@@ -199,7 +193,8 @@ final class AppViewModel: ObservableObject {
             do {
                 let metadata = try await metadataForRun(jobID: id)
                 let resolvedSettings = settings.resolved(for: metadata)
-                let outputURL = OutputURLBuilder.compressedOutputURL(for: jobs[index].inputURL, settings: resolvedSettings)
+                let inputURL = jobs[index].inputURL
+                let outputURL = OutputURLBuilder.compressedOutputURL(for: inputURL, settings: resolvedSettings)
                 updateJob(id) {
                     removeFrameFiles($0.outputFrames)
                     $0.metadata = metadata
@@ -213,11 +208,19 @@ final class AppViewModel: ObservableObject {
                     $0.errorMessage = nil
                 }
 
+                let speedSegments = try await detectSpeedSegments(
+                    inputURL: inputURL,
+                    metadata: metadata,
+                    settings: resolvedSettings,
+                    ffmpegURL: ffmpegURL
+                )
+
                 let plan = try FFmpegCommandBuilder(
                     settings: resolvedSettings,
-                    inputURL: jobs[index].inputURL,
+                    inputURL: inputURL,
                     outputURL: outputURL,
-                    metadata: metadata
+                    metadata: metadata,
+                    speedSegments: speedSegments
                 ).build()
 
                 let runner = CompressionRunner(executableURL: ffmpegURL)
@@ -253,6 +256,30 @@ final class AppViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Runs the silence-detection pass when the setting is enabled. Returns [] when
+    /// disabled, when the file has no audio, or when nothing worth speeding up was
+    /// found — the job then compresses normally.
+    private func detectSpeedSegments(
+        inputURL: URL,
+        metadata: MediaMetadata,
+        settings: CompressionSettings,
+        ffmpegURL: URL
+    ) async throws -> [SpeedSegment] {
+        guard settings.speedUpSilence, metadata.hasAudio else { return [] }
+
+        let detector = SilenceDetector(ffmpegURL: ffmpegURL)
+        let duration = metadata.duration
+        let silences = try await Task.detached(priority: .userInitiated) {
+            try detector.detectSilences(in: inputURL, mediaDuration: duration)
+        }.value
+
+        return SilenceSpeedupPlanner.segments(
+            silences: silences,
+            duration: duration,
+            silentSpeed: settings.silenceSpeed.multiplier
+        )
     }
 
     private func metadataForRun(jobID: UUID) async throws -> MediaMetadata {

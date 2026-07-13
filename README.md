@@ -6,18 +6,16 @@ A small, fast macOS app for compressing video and audio files. No upsells, no te
 - Drop audio files (e.g. WAV) → MP3
 - Mixed queues work — each file is auto-routed by type
 - Quality mode (CRF) or target-size mode (two-pass)
+- Optional silence speed-up: quiet stretches (≥1s) play at 2-8x while speech stays at normal pace — great for lectures, meetings, and screen recordings
 - Side-by-side comparison view with frame extraction
 
 Built with Swift + SwiftUI, wraps `ffmpeg`/`ffprobe`.
 
 ## Requirements
 
-- macOS 13 or later
-- [`ffmpeg`](https://ffmpeg.org) and `ffprobe` installed and on PATH
-
-```sh
-brew install ffmpeg
-```
+- macOS 13 or later (Apple Silicon)
+- The prebuilt `.app` from Releases bundles `ffmpeg` and `ffprobe` — no separate install needed.
+- If you build from source without running the packaging script, you'll need `ffmpeg` and `ffprobe` on PATH (e.g. `brew install ffmpeg`).
 
 ## Install
 
@@ -64,6 +62,6 @@ Project layout:
 
 ## License
 
-[MIT](LICENSE) — do whatever you want with it.
+Media Compressor's own source is [MIT](LICENSE) — do whatever you want with it.
 
-`ffmpeg` itself is not bundled; users install it separately via Homebrew.
+The packaged `.app` bundles static `ffmpeg`/`ffprobe` binaries (Apple Silicon, from [osxexperts.net](https://www.osxexperts.net/)), which are licensed under the **GPL**. See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the GPL distribution notice and source links.

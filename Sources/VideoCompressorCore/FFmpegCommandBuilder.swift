@@ -28,24 +28,36 @@ public struct FFmpegCommandBuilder: Sendable {
     public var outputURL: URL
     public var metadata: MediaMetadata
     public var passLogBaseURL: URL?
+    public var speedSegments: [SpeedSegment]
+    public var scratchDirectoryURL: URL?
 
     public init(
         settings: CompressionSettings,
         inputURL: URL,
         outputURL: URL,
         metadata: MediaMetadata,
-        passLogBaseURL: URL? = nil
+        passLogBaseURL: URL? = nil,
+        speedSegments: [SpeedSegment] = [],
+        scratchDirectoryURL: URL? = nil
     ) {
         self.settings = settings
         self.inputURL = inputURL
         self.outputURL = outputURL
         self.metadata = metadata
         self.passLogBaseURL = passLogBaseURL
+        self.speedSegments = speedSegments
+        self.scratchDirectoryURL = scratchDirectoryURL
     }
 
     public func build() throws -> CompressionPlan {
         if settings.outputPreset.isAudioOnly {
+            if !speedSegments.isEmpty {
+                return try audioOnlySpeedupPlan()
+            }
             return CompressionPlan(commands: [audioOnlyCommand(outputURL: outputURL, durationLimit: nil)])
+        }
+        if !speedSegments.isEmpty {
+            return try silenceSpeedupPlan()
         }
         switch settings.mode {
         case .quality:
@@ -145,19 +157,145 @@ public struct FFmpegCommandBuilder: Sendable {
         )
     }
 
+    // MARK: - Silence speedup
+
+    /// Speeding up quiet stretches requires trim/concat on exact timestamps, which
+    /// desyncs A/V on variable-frame-rate sources (screen recordings, phone video).
+    /// So the plan mirrors the proven two-step approach: first normalize to constant
+    /// frame rate into a near-lossless temp file, then apply the speed filtergraph
+    /// as part of the regular compression encode.
+    private func silenceSpeedupPlan() throws -> CompressionPlan {
+        let token = UUID().uuidString
+        let scratch = scratchDirectory()
+        let cfrURL = scratch.appendingPathComponent("video-compressor-cfr-\(token).mov")
+        let estimatedDuration = SilenceSpeedupPlanner.estimatedDuration(of: speedSegments)
+
+        let fullGraphURL = scratch.appendingPathComponent("video-compressor-graph-\(token).txt")
+        try writeFiltergraph(includeVideo: true, includeAudio: metadata.hasAudio, to: fullGraphURL)
+
+        var cleanupURLs = [cfrURL, fullGraphURL]
+        var commands = [cfrNormalizeCommand(outputURL: cfrURL)]
+        var videoBitrate: Int?
+
+        switch settings.mode {
+        case .quality:
+            var arguments = baseArguments(inputPath: cfrURL.path)
+            arguments += filtergraphMapArguments(graphURL: fullGraphURL, includeAudio: metadata.hasAudio)
+            arguments += qualityVideoArguments()
+            if metadata.hasAudio {
+                arguments += audioArguments()
+            }
+            arguments += fastStartArguments()
+            arguments += [outputURL.path]
+            commands.append(FFmpegCommand(arguments: arguments, duration: estimatedDuration))
+        case .targetSize:
+            let bitrate = try calculatedVideoBitrateKbps(duration: estimatedDuration)
+            videoBitrate = bitrate
+            let passLog = passLogBaseURL ?? scratch.appendingPathComponent("video-compressor-\(token)")
+
+            let videoGraphURL = scratch.appendingPathComponent("video-compressor-graph-v-\(token).txt")
+            try writeFiltergraph(includeVideo: true, includeAudio: false, to: videoGraphURL)
+            cleanupURLs.append(videoGraphURL)
+            cleanupURLs += passLogCleanupURLs(for: passLog)
+
+            var firstPass = baseArguments(inputPath: cfrURL.path)
+            firstPass += ["-filter_complex_script", videoGraphURL.path, "-map", "[outv]"]
+            firstPass += bitrateVideoArguments(videoBitrateKbps: bitrate)
+            firstPass += firstPassArguments(passLog: passLog)
+
+            var secondPass = baseArguments(inputPath: cfrURL.path)
+            secondPass += filtergraphMapArguments(graphURL: fullGraphURL, includeAudio: metadata.hasAudio)
+            secondPass += bitrateVideoArguments(videoBitrateKbps: bitrate)
+            secondPass += secondPassArguments(passLog: passLog)
+            if metadata.hasAudio {
+                secondPass += audioArguments()
+            }
+            secondPass += fastStartArguments()
+            secondPass += [outputURL.path]
+
+            commands.append(FFmpegCommand(arguments: firstPass, duration: estimatedDuration))
+            commands.append(FFmpegCommand(arguments: secondPass, duration: estimatedDuration))
+        }
+
+        return CompressionPlan(commands: commands, cleanupURLs: cleanupURLs, videoBitrateKbps: videoBitrate)
+    }
+
+    private func audioOnlySpeedupPlan() throws -> CompressionPlan {
+        let scratch = scratchDirectory()
+        let graphURL = scratch.appendingPathComponent("video-compressor-graph-\(UUID().uuidString).txt")
+        try writeFiltergraph(includeVideo: false, includeAudio: true, to: graphURL)
+
+        var arguments = baseArguments()
+        arguments += [
+            "-filter_complex_script", graphURL.path,
+            "-map", "[outa]",
+            "-c:a", "libmp3lame",
+            "-b:a", settings.audioBitrate.ffmpegValue,
+            outputURL.path
+        ]
+
+        let estimatedDuration = SilenceSpeedupPlanner.estimatedDuration(of: speedSegments)
+        return CompressionPlan(
+            commands: [FFmpegCommand(arguments: arguments, duration: estimatedDuration)],
+            cleanupURLs: [graphURL]
+        )
+    }
+
+    private func cfrNormalizeCommand(outputURL cfrURL: URL) -> FFmpegCommand {
+        let fps = metadata.frameRate ?? 30
+        var arguments = baseArguments()
+        arguments += [
+            "-vf", String(format: "fps=%.6f", fps),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+            "-video_track_timescale", "90000"
+        ]
+        if metadata.hasAudio {
+            // PCM keeps the intermediate lossless so audio is only re-encoded once.
+            arguments += ["-c:a", "pcm_s16le"]
+        }
+        arguments += [cfrURL.path]
+        return FFmpegCommand(arguments: arguments, duration: metadata.duration)
+    }
+
+    private func writeFiltergraph(includeVideo: Bool, includeAudio: Bool, to url: URL) throws {
+        let graph = SilenceSpeedupPlanner.filtergraph(
+            segments: speedSegments,
+            includeVideo: includeVideo,
+            includeAudio: includeAudio,
+            scaleFilter: includeVideo ? resolutionScaleExpression() : nil
+        )
+        try graph.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func filtergraphMapArguments(graphURL: URL, includeAudio: Bool) -> [String] {
+        var arguments = ["-filter_complex_script", graphURL.path, "-map", "[outv]"]
+        if includeAudio {
+            arguments += ["-map", "[outa]"]
+        }
+        return arguments
+    }
+
+    private func scratchDirectory() -> URL {
+        scratchDirectoryURL ?? URL(fileURLWithPath: NSTemporaryDirectory())
+    }
+
     public func calculatedVideoBitrateKbps() throws -> Int {
-        guard metadata.duration > 0 else {
+        try calculatedVideoBitrateKbps(duration: metadata.duration)
+    }
+
+    private func calculatedVideoBitrateKbps(duration: Double) throws -> Int {
+        guard duration > 0 else {
             throw CompressionError.invalidDuration
         }
 
         let audioKbps = metadata.hasAudio ? settings.audioBitrate.rawValue : 0
         let totalBits = settings.targetSizeMB * 1024 * 1024 * 8
         let usableBits = totalBits * 0.97
-        let totalKbps = usableBits / metadata.duration / 1000
+        let totalKbps = usableBits / duration / 1000
         let videoKbps = Int(floor(totalKbps - Double(audioKbps)))
 
         guard videoKbps >= 150 else {
-            let minimumBits = Double(150 + audioKbps) * 1000 * metadata.duration / 0.97
+            let minimumBits = Double(150 + audioKbps) * 1000 * duration / 0.97
             let minimumMB = minimumBits / 8 / 1024 / 1024
             throw CompressionError.targetSizeTooSmall(minimumMB: minimumMB)
         }
@@ -165,14 +303,14 @@ public struct FFmpegCommandBuilder: Sendable {
         return videoKbps
     }
 
-    private func baseArguments(durationLimit: Double? = nil) -> [String] {
+    private func baseArguments(durationLimit: Double? = nil, inputPath: String? = nil) -> [String] {
         var arguments = [
             "-hide_banner",
             "-nostdin",
             "-y",
             "-progress", "pipe:1",
             "-nostats",
-            "-i", inputURL.path
+            "-i", inputPath ?? inputURL.path
         ]
         if let durationLimit {
             arguments += ["-t", formattedSeconds(durationLimit)]
@@ -265,9 +403,13 @@ public struct FFmpegCommandBuilder: Sendable {
     }
 
     private func appendResolutionFilter(to arguments: inout [String]) {
-        guard let maxHeight = settings.resolutionCap.maxHeight else { return }
-        let filter = "scale=w=trunc((iw*min(1\\,\(maxHeight)/ih))/2)*2:h=trunc((ih*min(1\\,\(maxHeight)/ih))/2)*2"
+        guard let filter = resolutionScaleExpression() else { return }
         arguments += ["-vf", filter]
+    }
+
+    private func resolutionScaleExpression() -> String? {
+        guard let maxHeight = settings.resolutionCap.maxHeight else { return nil }
+        return "scale=w=trunc((iw*min(1\\,\(maxHeight)/ih))/2)*2:h=trunc((ih*min(1\\,\(maxHeight)/ih))/2)*2"
     }
 
     private func passLogCleanupURLs(for baseURL: URL) -> [URL] {
