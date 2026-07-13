@@ -181,6 +181,123 @@ enum VideoCompressorChecks {
             try checks.expect(plan.commands[0].duration == 4)
         }
 
+        try checks.run("silence planner builds margin-adjusted segments") {
+            let silences = [SilenceInterval(start: 2, end: 6)]
+            let segments = SilenceSpeedupPlanner.segments(silences: silences, duration: 10, silentSpeed: 4, margin: 1)
+
+            try checks.expect(segments == [
+                SpeedSegment(start: 0, end: 2, speed: 1),
+                SpeedSegment(start: 2, end: 5, speed: 4),
+                SpeedSegment(start: 5, end: 10, speed: 1)
+            ])
+            try checks.expect(abs(SilenceSpeedupPlanner.estimatedDuration(of: segments) - 7.75) < 0.001)
+        }
+
+        try checks.run("silence planner skips short silences and no-ops") {
+            let short = SilenceSpeedupPlanner.segments(
+                silences: [SilenceInterval(start: 2, end: 3)],
+                duration: 10,
+                silentSpeed: 4,
+                margin: 1
+            )
+            try checks.expect(short.isEmpty)
+            try checks.expect(SilenceSpeedupPlanner.segments(silences: [], duration: 10, silentSpeed: 4).isEmpty)
+        }
+
+        try checks.run("silence detector parse handles trailing silence") {
+            let log = """
+            [silencedetect @ 0x0] silence_start: 2.5
+            [silencedetect @ 0x0] silence_end: 6.25 | silence_duration: 3.75
+            [silencedetect @ 0x0] silence_start: 8.0
+            """
+            let silences = SilenceDetector.parse(log: log, mediaDuration: 10)
+            try checks.expect(silences == [
+                SilenceInterval(start: 2.5, end: 6.25),
+                SilenceInterval(start: 8.0, end: 10)
+            ])
+        }
+
+        try checks.run("atempo chains for speeds above 2x") {
+            try checks.expect(SilenceSpeedupPlanner.atempoChain(for: 2) == "atempo=2.000000")
+            try checks.expect(SilenceSpeedupPlanner.atempoChain(for: 8) == "atempo=2.0,atempo=2.0,atempo=2.000000")
+        }
+
+        try checks.run("silence speedup builds CFR pass plus filtergraph encode") {
+            let scratch = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: scratch) }
+
+            let segments = SilenceSpeedupPlanner.segments(
+                silences: [SilenceInterval(start: 2, end: 6)],
+                duration: 10,
+                silentSpeed: 4
+            )
+            let plan = try FFmpegCommandBuilder(
+                settings: .defaults,
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: sampleMetadata,
+                speedSegments: segments,
+                scratchDirectoryURL: scratch
+            ).build()
+
+            try checks.expect(plan.commands.count == 2)
+            let cfr = plan.commands[0].arguments
+            try checks.expect(cfr.containsSequence(["-crf", "16"]))
+            try checks.expect(cfr.containsSequence(["-c:a", "pcm_s16le"]))
+            try checks.expect(cfr.contains { $0.hasPrefix("fps=") })
+
+            let encode = plan.commands[1].arguments
+            try checks.expect(encode.contains("-filter_complex_script"))
+            try checks.expect(encode.containsSequence(["-map", "[outv]"]))
+            try checks.expect(encode.containsSequence(["-map", "[outa]"]))
+            try checks.expect(encode.containsSequence(["-c:v", "libx264"]))
+            try checks.expect(abs(plan.commands[1].duration - 7.75) < 0.001)
+
+            let graphIndex = encode.firstIndex(of: "-filter_complex_script")!
+            let graph = try String(contentsOfFile: encode[graphIndex + 1], encoding: .utf8)
+            try checks.expect(graph.contains("concat=n=3:v=1:a=1[outv][outa]"))
+            try checks.expect(graph.contains("atempo=2.0,atempo=2.0"))
+        }
+
+        try checks.run("silence speedup supports target-size and mp3 output") {
+            let scratch = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: scratch) }
+
+            let segments = SilenceSpeedupPlanner.segments(
+                silences: [SilenceInterval(start: 2, end: 6)],
+                duration: 10,
+                silentSpeed: 4
+            )
+
+            let targetPlan = try FFmpegCommandBuilder(
+                settings: CompressionSettings(mode: .targetSize, targetSizeMB: 5),
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: sampleMetadata,
+                speedSegments: segments,
+                scratchDirectoryURL: scratch
+            ).build()
+            try checks.expect(targetPlan.commands.count == 3)
+            try checks.expect(targetPlan.videoBitrateKbps != nil)
+            try checks.expect(targetPlan.commands[1].arguments.containsSequence(["-pass", "1"]))
+            try checks.expect(targetPlan.commands[2].arguments.containsSequence(["-pass", "2"]))
+            try checks.expect(targetPlan.commands[2].arguments.contains("-filter_complex_script"))
+
+            let mp3Plan = try FFmpegCommandBuilder(
+                settings: CompressionSettings(outputPreset: .mp3),
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp3"),
+                metadata: sampleMetadata,
+                speedSegments: segments,
+                scratchDirectoryURL: scratch
+            ).build()
+            try checks.expect(mp3Plan.commands.count == 1)
+            let mp3Arguments = mp3Plan.commands[0].arguments
+            try checks.expect(mp3Arguments.contains("-filter_complex_script"))
+            try checks.expect(mp3Arguments.containsSequence(["-map", "[outa]"]))
+            try checks.expect(mp3Arguments.containsSequence(["-c:a", "libmp3lame"]))
+        }
+
         if let tools = requiredTools() {
             try await checks.run("quality compression produces H.264/AAC MP4") {
                 let directory = try makeTemporaryDirectory()
@@ -284,6 +401,49 @@ enum VideoCompressorChecks {
                 try checks.expect(outputMetadata.pixelFormat == "yuv420p")
                 try checks.expect(outputMetadata.formatName?.contains("mp4") == true)
             }
+            try await checks.run("silence speedup shortens video with silent middle") {
+                let directory = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+
+                let input = directory.appendingPathComponent("input.mov")
+                let output = directory.appendingPathComponent("output.mp4")
+                try generateSyntheticVideoWithSilence(
+                    ffmpeg: tools.ffmpeg,
+                    output: input,
+                    duration: 9,
+                    silentRange: (3, 7)
+                )
+
+                let metadata = try MediaProbeService(ffprobeURL: tools.ffprobe).probe(input)
+                let silences = try SilenceDetector(ffmpegURL: tools.ffmpeg)
+                    .detectSilences(in: input, mediaDuration: metadata.duration)
+                try checks.expect(!silences.isEmpty, "expected detected silence")
+
+                let segments = SilenceSpeedupPlanner.segments(
+                    silences: silences,
+                    duration: metadata.duration,
+                    silentSpeed: 4
+                )
+                try checks.expect(segments.contains { $0.speed == 4 })
+
+                let plan = try FFmpegCommandBuilder(
+                    settings: .defaults,
+                    inputURL: input,
+                    outputURL: output,
+                    metadata: metadata,
+                    speedSegments: segments,
+                    scratchDirectoryURL: directory
+                ).build()
+                try await CompressionRunner(executableURL: tools.ffmpeg).run(plan: plan) { _ in }
+
+                let outputMetadata = try MediaProbeService(ffprobeURL: tools.ffprobe).probe(output)
+                try checks.expect(outputMetadata.videoCodec == "h264")
+                try checks.expect(outputMetadata.audioCodec == "aac")
+                try checks.expect(
+                    outputMetadata.duration < metadata.duration - 1,
+                    "expected output noticeably shorter than input (\(outputMetadata.duration) vs \(metadata.duration))"
+                )
+            }
         } else {
             print("Skipping FFmpeg integration checks because ffmpeg or ffprobe was not found.")
         }
@@ -348,6 +508,40 @@ enum VideoCompressorChecks {
             "-f", "lavfi",
             "-i", "sine=frequency=1000:sample_rate=48000",
             "-t", "\(duration)",
+            output.path
+        ]
+
+        let stderr = Pipe()
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+
+        if process.terminationStatus != 0 {
+            let message = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw CompressionError.processFailed(status: process.terminationStatus, stderr: message)
+        }
+    }
+
+    private static func generateSyntheticVideoWithSilence(
+        ffmpeg: URL,
+        output: URL,
+        duration: Int,
+        silentRange: (Double, Double)
+    ) throws {
+        let process = Process()
+        process.executableURL = ffmpeg
+        process.arguments = [
+            "-hide_banner",
+            "-y",
+            "-f", "lavfi",
+            "-i", "testsrc=size=320x180:rate=30",
+            "-f", "lavfi",
+            "-i", "sine=frequency=1000:sample_rate=48000",
+            "-t", "\(duration)",
+            "-af", "volume='if(between(t,\(silentRange.0),\(silentRange.1)),0,1)':eval=frame",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
             output.path
         ]
 
