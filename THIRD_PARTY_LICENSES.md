@@ -39,3 +39,7 @@ A copy of the GNU General Public License v2 is available at
 If you'd prefer not to use the bundled binaries, build from source — the app
 falls back to a system-wide `ffmpeg`/`ffprobe` (e.g. `brew install ffmpeg`)
 when no bundled binaries are present in `Contents/Resources/`.
+
+## Archivo and Schibsted Grotesk (fonts)
+
+The app bundles static cuts of [Archivo](https://github.com/Omnibus-Type/Archivo) (Omnibus-Type) and [Schibsted Grotesk](https://github.com/schibsted/schibsted-grotesk) (Schibsted), both licensed under the [SIL Open Font License 1.1](https://openfontlicense.org). The fonts are unmodified apart from instancing fixed weights from the variable sources.

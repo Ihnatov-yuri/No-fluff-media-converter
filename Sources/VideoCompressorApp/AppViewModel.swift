@@ -5,8 +5,10 @@ import VideoCompressorCore
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var jobs: [CompressionJob] = []
-    @Published var settings = CompressionSettings.defaults {
+    @Published var settings = AppViewModel.loadSettings() {
         didSet {
+            guard settings != oldValue else { return }
+            saveSettings()
             refreshPendingOutputURLs()
             invalidatePendingPreviews()
         }
@@ -60,16 +62,31 @@ final class AppViewModel: ObservableObject {
         jobs.filter { $0.status == .completed }.count
     }
 
+    var canRemoveSelected: Bool {
+        guard let selectedJob else { return false }
+        return selectedJob.status != .running
+    }
+
     var summaryText: String {
         if jobs.isEmpty {
-            return "Drop media to begin"
+            return "No files yet"
         }
         let total = jobs.count
         let completed = completedCount
         if isRunning {
-            return "Compressing \(completed) of \(total) completed"
+            return "Compressing file \(min(completed + 1, total)) of \(total)"
         }
-        return "\(total) file\(total == 1 ? "" : "s"), \(completed) completed"
+        return "\(total) file\(total == 1 ? "" : "s") · \(completed) completed"
+    }
+
+    /// Bytes saved across every completed job, or nil when nothing has finished.
+    var totalSavings: (original: Int64, output: Int64)? {
+        let finished = jobs.filter { $0.status == .completed && $0.outputSizeBytes != nil }
+        guard !finished.isEmpty else { return nil }
+        return (
+            finished.reduce(0) { $0 + $1.originalSizeBytes },
+            finished.reduce(0) { $0 + ($1.outputSizeBytes ?? 0) }
+        )
     }
 
     func addFiles(_ urls: [URL]) {
@@ -155,13 +172,43 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func removeSelectedJob() {
+        guard canRemoveSelected, let selectedJob else { return }
+        removeJob(selectedJob.id)
+    }
+
+    /// Removes a job from the queue. Never touches the source or a finished output.
+    func removeJob(_ id: UUID) {
+        guard let index = jobs.firstIndex(where: { $0.id == id }),
+              jobs[index].status != .running else { return }
+        if jobs[index].previewStatus == .rendering {
+            activePreviewRunner?.cancel()
+        }
+        removeTemporaryFiles(for: jobs[index])
+        jobs.remove(at: index)
+        if selectedJobID == id {
+            selectedJobID = jobs.indices.contains(index) ? jobs[index].id : jobs.last?.id
+        }
+    }
+
+    /// Deletes every sample and comparison frame this session wrote to the temp directory.
+    func removeAllTemporaryFiles() {
+        for job in jobs {
+            removeTemporaryFiles(for: job)
+        }
+    }
+
+    private func removeTemporaryFiles(for job: CompressionJob) {
+        if let previewURL = job.previewURL {
+            try? FileManager.default.removeItem(at: previewURL)
+        }
+        removeFrameFiles(job.previewFrames)
+        removeFrameFiles(job.outputFrames)
+    }
+
     func clearCompleted() {
         for job in jobs where job.status == .completed {
-            if let previewURL = job.previewURL {
-                try? FileManager.default.removeItem(at: previewURL)
-            }
-            removeFrameFiles(job.previewFrames)
-            removeFrameFiles(job.outputFrames)
+            removeTemporaryFiles(for: job)
         }
         jobs.removeAll { $0.status == .completed }
         if let selectedJobID, !jobs.contains(where: { $0.id == selectedJobID }) {
@@ -187,14 +234,17 @@ final class AppViewModel: ObservableObject {
 
         let ids = jobs.filter { $0.status.canRun }.map(\.id)
         for id in ids {
-            guard let index = jobs.firstIndex(where: { $0.id == id }) else { continue }
+            guard let inputURL = jobs.first(where: { $0.id == id })?.inputURL else { continue }
             selectedJobID = id
+            var startedOutputURL: URL?
 
             do {
                 let metadata = try await metadataForRun(jobID: id)
                 let resolvedSettings = settings.resolved(for: metadata)
-                let inputURL = jobs[index].inputURL
                 let outputURL = OutputURLBuilder.compressedOutputURL(for: inputURL, settings: resolvedSettings)
+                // The builder never reuses an existing name, so anything at this
+                // path after a failure is our own partial file and safe to delete.
+                startedOutputURL = outputURL
                 updateJob(id) {
                     removeFrameFiles($0.outputFrames)
                     $0.metadata = metadata
@@ -244,18 +294,44 @@ final class AppViewModel: ObservableObject {
                 }
                 lastCompletedJobID = id
             } catch CompressionError.cancelled {
+                removePartialOutput(startedOutputURL)
                 updateJob(id) {
                     $0.status = .cancelled
+                    $0.progress = 0
                     $0.errorMessage = CompressionError.cancelled.localizedDescription
                 }
                 break
             } catch {
+                removePartialOutput(startedOutputURL)
                 updateJob(id) {
                     $0.status = .failed
+                    $0.progress = 0
                     $0.errorMessage = error.localizedDescription
                 }
             }
         }
+    }
+
+    private func removePartialOutput(_ url: URL?) {
+        guard let url else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    // MARK: - Settings persistence
+
+    private static let settingsDefaultsKey = "compressionSettings"
+
+    private static func loadSettings() -> CompressionSettings {
+        guard let data = UserDefaults.standard.data(forKey: settingsDefaultsKey),
+              let stored = try? JSONDecoder().decode(CompressionSettings.self, from: data) else {
+            return .defaults
+        }
+        return stored
+    }
+
+    private func saveSettings() {
+        guard let data = try? JSONEncoder().encode(settings) else { return }
+        UserDefaults.standard.set(data, forKey: Self.settingsDefaultsKey)
     }
 
     /// Runs the silence-detection pass when the setting is enabled. Returns [] when
@@ -422,7 +498,11 @@ final class AppViewModel: ObservableObject {
                 case .failure(let error):
                     self.updateJob(id) {
                         $0.status = .failed
-                        $0.errorMessage = error.localizedDescription
+                        if case CompressionError.processFailed = error {
+                            $0.errorMessage = "Not a media file FFmpeg can read."
+                        } else {
+                            $0.errorMessage = error.localizedDescription
+                        }
                     }
                 }
             }

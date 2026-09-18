@@ -1,5 +1,4 @@
 import AppKit
-import AVKit
 import SwiftUI
 import UniformTypeIdentifiers
 import VideoCompressorCore
@@ -8,28 +7,19 @@ struct ContentView: View {
     @EnvironmentObject private var viewModel: AppViewModel
 
     var body: some View {
-        VStack(spacing: 0) {
-            SettingsBar(settings: $viewModel.settings)
+        VStack(spacing: AppMetric.gutter) {
+            TopBar()
 
-            InfoStrip()
+            SettingsPanel(settings: $viewModel.settings)
 
-            Divider()
-
-            ZStack {
-                JobTable()
-
-                if viewModel.jobs.isEmpty {
-                    EmptyDropView(isTargeted: viewModel.isDropTargeted)
-                        .padding(28)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            Divider()
+            QueuePanel(openPanel: openPanel)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             ActionBar(openPanel: openPanel)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .padding([.horizontal, .bottom], AppMetric.gutter)
+        .ignoresSafeArea(.container, edges: .top)
+        .background(LitField())
         .onDrop(
             of: [UTType.fileURL.identifier],
             isTargeted: $viewModel.isDropTargeted,
@@ -51,6 +41,8 @@ struct ContentView: View {
         .sheet(item: $viewModel.comparisonRequest) { request in
             ComparisonView(request: request)
                 .environmentObject(viewModel)
+                .tint(AppColor.accent)
+                .preferredColorScheme(.light)
         }
     }
 
@@ -95,852 +87,583 @@ struct ContentView: View {
     }
 }
 
-private struct SettingsBar: View {
+// MARK: - Top bar
+
+/// Sits in the hidden title bar, to the right of the traffic lights.
+private struct TopBar: View {
+    var body: some View {
+        HStack(alignment: .center, spacing: AppMetric.m) {
+            Wordmark(size: 15)
+            Spacer()
+            Link(destination: URL(string: "https://ihnatov.nl")!) {
+                Text("by Yuri Ihnatov")
+                    .uiLabel(12.5, color: AppColor.ink3)
+            }
+            .help("Open source and free. ihnatov.nl")
+        }
+        .padding(.leading, 68)
+        .padding(.trailing, 6)
+        .frame(height: 38)
+    }
+}
+
+// MARK: - Settings
+
+private struct SettingsPanel: View {
     @EnvironmentObject private var viewModel: AppViewModel
     @Binding var settings: CompressionSettings
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .center, spacing: 14) {
-                Picker("Mode", selection: $settings.mode) {
-                    ForEach(CompressionMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode)
-                    }
+        VStack(alignment: .leading, spacing: AppMetric.m) {
+            HStack(alignment: .bottom, spacing: AppMetric.gutter) {
+                LabeledField("Mode") {
+                    PillTabs(
+                        options: CompressionMode.allCases.map { ($0, $0.displayName) },
+                        selection: $settings.mode
+                    )
+                    .fixedSize()
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 230)
 
                 if settings.mode == .quality {
-                    HStack(spacing: 8) {
-                        Picker("Quality", selection: $settings.qualityPreset) {
-                            ForEach(QualityPreset.allCases) { quality in
-                                Text(quality.displayName).tag(quality)
-                            }
-                        }
-                        .frame(width: 190)
-
-                        Text(settings.outputPreset.isAudioOnly
-                             ? settings.qualityPreset.detailText
-                             : "\(settings.qualityPreset.detailText), CRF \(settings.crf)")
-                            .font(.mono(.caption))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 150, alignment: .leading)
+                    LabeledField("Quality") {
+                        LitMenuPicker(
+                            options: QualityPreset.allCases.map { ($0, $0.displayName) },
+                            selection: $settings.qualityPreset
+                        )
                     }
                 } else {
-                    HStack(spacing: 8) {
-                        Text("Target")
-                        TextField("MB", value: $settings.targetSizeMB, format: .number.precision(.fractionLength(0...1)))
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 82)
-                        Text("MB")
-                            .foregroundStyle(.secondary)
+                    LabeledField("Target size") {
+                        TargetSizeField(value: $settings.targetSizeMB)
                     }
                 }
 
-                Spacer(minLength: 12)
-
-                Picker("Format", selection: $settings.outputPreset) {
-                    ForEach(OutputPreset.allCases) { preset in
-                        Text(preset.shortName).tag(preset)
-                    }
+                LabeledField("Format") {
+                    LitMenuPicker(
+                        options: OutputPreset.allCases.map { ($0, $0.shortName) },
+                        selection: $settings.outputPreset
+                    )
                 }
-                .frame(width: 150)
+
+                LabeledField("Resolution") {
+                    LitMenuPicker(
+                        options: ResolutionCap.allCases.map { ($0, $0.displayName) },
+                        selection: $settings.resolutionCap
+                    )
+                }
+                .disabled(settings.outputPreset.isAudioOnly)
+
+                LabeledField("Audio") {
+                    LitMenuPicker(
+                        options: AudioBitrate.allCases.map { ($0, $0.displayName) },
+                        selection: $settings.audioBitrate
+                    )
+                }
+                .help("Audio bitrate. AAC for MP4 and MOV, MP3 for MP3.")
             }
 
-            HStack(alignment: .center, spacing: 14) {
-                Picker("Resolution", selection: $settings.resolutionCap) {
-                    ForEach(ResolutionCap.allCases) { cap in
-                        Text(cap.displayName).tag(cap)
-                    }
-                }
-                .frame(width: 180)
+            Hairline()
 
-                Picker("Audio", selection: $settings.audioBitrate) {
-                    ForEach(AudioBitrate.allCases) { bitrate in
-                        Text(bitrate.displayName).tag(bitrate)
-                    }
+            HStack(alignment: .center, spacing: AppMetric.m) {
+                Toggle(isOn: $settings.speedUpSilence) {
+                    Text("Speed up silence")
+                        .font(AppFont.display(13.5, weight: .semibold))
+                        .foregroundStyle(AppColor.ink)
                 }
-                .frame(width: 150)
-                .help("Audio bitrate. Used as AAC for MP4/MOV outputs and as MP3 for MP3 outputs.")
-
-                Toggle("Speed up silence", isOn: $settings.speedUpSilence)
-                    .toggleStyle(.checkbox)
-                    .help("Plays quiet stretches longer than a second at higher speed while keeping speech at normal pace. Great for lectures, meetings, and screen recordings.")
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .tint(AppColor.accent)
+                .help("Plays quiet stretches longer than a second faster while speech stays at normal pace. Good for lectures, meetings, and screen recordings.")
 
                 if settings.speedUpSilence {
-                    Picker("Silence speed", selection: $settings.silenceSpeed) {
-                        ForEach(SilenceSpeed.allCases) { speed in
-                            Text(speed.displayName).tag(speed)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 66)
+                    PillTabs(
+                        options: SilenceSpeed.allCases.map { ($0, $0.displayName) },
+                        selection: $settings.silenceSpeed
+                    )
+                    .fixedSize()
                     .help("How fast the quiet parts play back.")
                 }
 
-                Text(settings.outputPreset.compatibilitySummary)
-                    .font(.mono(.caption))
-                    .foregroundStyle(settings.outputPreset.isBestWindowsChoice ? Color.green : Color.secondary)
+                Spacer(minLength: AppMetric.m)
 
-                Spacer()
+                Text(summary)
+                    .font(AppFont.text(13))
+                    .foregroundStyle(AppColor.ink3)
+                    .lineLimit(1)
             }
+            .frame(minHeight: AppMetric.controlHeight)
         }
         .disabled(viewModel.isRunning)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
+        .padding(.horizontal, AppMetric.l)
+        .padding(.top, AppMetric.m)
+        .padding(.bottom, AppMetric.s)
+        .litGlass()
+    }
+
+    /// One plain sentence stating what the current settings will produce.
+    private var summary: String {
+        var parts = [settings.outputPreset.compatibilitySummary]
+        if settings.outputPreset.isAudioOnly {
+            parts.append(settings.audioBitrate.displayName)
+        } else {
+            switch settings.mode {
+            case .quality:
+                parts.append("\(settings.qualityPreset.detailText), CRF \(settings.crf)")
+            case .targetSize:
+                parts.append("Two-pass to fit the target")
+            }
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
-private struct InfoStrip: View {
+/// A typed number, not a slider: people want an exact size.
+private struct TargetSizeField: View {
+    @Binding var value: Double
+    @State private var hovering = false
+
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "info.circle")
-                .foregroundStyle(.secondary)
-            Text("Created by")
-                .foregroundStyle(.secondary)
-            Link("Yuri Ihnatov", destination: URL(string: "https://ihnatov.nl")!)
-            Text("as a quick, reliable media converter. Open source and free.")
-                .foregroundStyle(.secondary)
-            Spacer()
+            TextField(
+                "",
+                value: Binding(
+                    get: { value },
+                    set: { value = min(max($0, 1), 100_000) }
+                ),
+                format: .number.precision(.fractionLength(0...1))
+            )
+            .textFieldStyle(.plain)
+            .font(AppFont.display(13.5, weight: .semibold))
+            .monospacedDigit()
+            .foregroundStyle(AppColor.ink)
+            .multilineTextAlignment(.trailing)
+            .accessibilityLabel("Target size in megabytes")
+
+            Text("MB")
+                .uiLabel(12.5, color: AppColor.ink4)
         }
-        .font(.mono(.caption))
-        .padding(.horizontal, 16)
-        .padding(.bottom, 10)
+        .padding(.horizontal, 12)
+        .frame(height: AppMetric.controlHeight)
+        .frame(minWidth: 110)
+        .litControlSurface(hovering: hovering)
+        .onHover { hovering = $0 }
     }
 }
 
-private struct JobTable: View {
+// MARK: - Queue
+
+private enum QueueColumn {
+    static let media: CGFloat = 150
+    static let output: CGFloat = 130
+    static let original: CGFloat = 78
+    static let compressed: CGFloat = 104
+    static let status: CGFloat = 176
+}
+
+private struct QueuePanel: View {
     @EnvironmentObject private var viewModel: AppViewModel
+    var openPanel: () -> Void
 
     var body: some View {
-        Table(viewModel.jobs, selection: $viewModel.selectedJobID) {
-            TableColumn("File") { job in
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(job.inputURL.lastPathComponent)
-                        .lineLimit(1)
-                    Text(job.inputURL.deletingLastPathComponent().path)
-                        .font(.mono(.caption))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+        Group {
+            if viewModel.jobs.isEmpty {
+                EmptyQueue(openPanel: openPanel)
+            } else {
+                VStack(spacing: 0) {
+                    QueueHeader()
+                    Hairline(strong: true)
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(viewModel.jobs) { job in
+                                QueueRow(job: job, isSelected: job.id == viewModel.selectedJobID)
+                                Hairline()
+                            }
+                        }
+                    }
                 }
             }
-
-            TableColumn("Original") { job in
-                Text(ByteCountFormatter.string(fromByteCount: job.originalSizeBytes, countStyle: .file))
-                    .monospacedDigit()
-            }
-            .width(90)
-
-            TableColumn("Media") { job in
-                Text(mediaSummary(job.metadata))
-                    .font(.mono(.caption))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .width(130)
-
-            TableColumn("Format") { job in
-                Text(formatLabel(for: job))
-                    .font(.mono(.caption))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .width(110)
-
-            TableColumn("Status") { job in
-                StatusLabel(job: job)
-            }
-            .width(130)
-
-            TableColumn("Progress") { job in
-                ProgressView(value: job.progress)
-                    .frame(width: 110)
-            }
-            .width(130)
-
-            TableColumn("Output") { job in
-                Text(job.outputURL.lastPathComponent)
-                    .font(.mono(.body))
-                    .lineLimit(1)
-                    .foregroundStyle(job.status == .completed ? .primary : .secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .litPanel()
+        .overlay {
+            // Drop feedback reuses the focus ring: state, not decoration.
+            if viewModel.isDropTargeted {
+                RoundedRectangle(cornerRadius: AppMetric.radiusPanel, style: .continuous)
+                    .strokeBorder(AppColor.accentOnLight, lineWidth: 2)
             }
         }
-    }
-
-    private func formatLabel(for job: CompressionJob) -> String {
-        let resolved = job.appliedSettings ?? viewModel.settings.resolved(for: job.metadata)
-        let preset = resolved.outputPreset
-        var label = preset.isAudioOnly
-            ? "\(preset.shortName) (\(resolved.audioBitrate.displayName))"
-            : preset.shortName
-        if resolved.speedUpSilence {
-            label += " · silence \(resolved.silenceSpeed.displayName)"
-        }
-        return label
-    }
-
-    private func mediaSummary(_ metadata: MediaMetadata?) -> String {
-        guard let metadata else { return "Reading..." }
-        if metadata.videoCodec == nil {
-            let codec = metadata.audioCodec?.uppercased() ?? "Audio"
-            return "\(codec) audio"
-        }
-        let size: String
-        if let width = metadata.width, let height = metadata.height {
-            size = "\(width)x\(height)"
-        } else {
-            size = "Unknown size"
-        }
-        let codec = metadata.videoCodec?.uppercased() ?? "Video"
-        return "\(codec), \(size)"
     }
 }
 
-private struct StatusLabel: View {
+private struct QueueHeader: View {
+    var body: some View {
+        HStack(spacing: AppMetric.m) {
+            Text("File").uiLabel().frame(maxWidth: .infinity, alignment: .leading)
+            Text("Source").uiLabel().frame(width: QueueColumn.media, alignment: .leading)
+            Text("Output").uiLabel().frame(width: QueueColumn.output, alignment: .leading)
+            Text("Original").uiLabel().frame(width: QueueColumn.original, alignment: .trailing)
+            Text("Compressed").uiLabel().frame(width: QueueColumn.compressed, alignment: .trailing)
+            Text("Status").uiLabel().frame(width: QueueColumn.status, alignment: .leading)
+        }
+        .padding(.horizontal, AppMetric.l)
+        .frame(height: 34)
+    }
+}
+
+private struct QueueRow: View {
+    @EnvironmentObject private var viewModel: AppViewModel
+    var job: CompressionJob
+    var isSelected: Bool
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: AppMetric.m) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.inputURL.lastPathComponent)
+                    .font(AppFont.display(13.5, weight: .semibold))
+                    .foregroundStyle(AppColor.ink)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(job.inputURL.deletingLastPathComponent().path)
+                    .font(AppFont.text(12))
+                    .foregroundStyle(AppColor.ink4)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(mediaSummary)
+                    .font(AppFont.text(13))
+                    .foregroundStyle(AppColor.ink2)
+                Text(job.metadata.map { durationText($0.duration) } ?? " ")
+                    .font(AppFont.text(12))
+                    .foregroundStyle(AppColor.ink4)
+            }
+            .lineLimit(1)
+            .frame(width: QueueColumn.media, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.metadata == nil ? " " : resolvedSettings.outputPreset.shortName)
+                    .font(AppFont.text(13))
+                    .foregroundStyle(AppColor.ink2)
+                Text(job.metadata == nil ? " " : outputDetail)
+                    .font(AppFont.text(12))
+                    .foregroundStyle(AppColor.ink4)
+            }
+            .lineLimit(1)
+            .frame(width: QueueColumn.output, alignment: .leading)
+
+            Text(byteString(job.originalSizeBytes))
+                .font(AppFont.text(13))
+                .foregroundStyle(AppColor.ink2)
+                .lineLimit(1)
+                .frame(width: QueueColumn.original, alignment: .trailing)
+
+            CompressedSizeCell(job: job, settings: resolvedSettings)
+                .frame(width: QueueColumn.compressed, alignment: .trailing)
+
+            StatusCell(job: job)
+                .frame(width: QueueColumn.status, alignment: .leading)
+        }
+        .padding(.horizontal, AppMetric.l)
+        .frame(height: 52)
+        .background(Color.white.opacity(isSelected ? 0.62 : (hovering ? 0.4 : 0)))
+        .overlay(alignment: .leading) {
+            // The active row is marked by an accent rule, not a filled block.
+            if isSelected {
+                Rectangle().fill(AppColor.accent).frame(width: 3)
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture(count: 2) {
+            viewModel.selectedJobID = job.id
+            if job.status == .completed {
+                viewModel.showSelectedOutputComparison()
+            }
+        }
+        .simultaneousGesture(TapGesture().onEnded {
+            viewModel.selectedJobID = job.id
+        })
+        .contextMenu {
+            Button("Reveal Output in Finder") {
+                viewModel.revealURL(job.outputURL)
+            }
+            .disabled(job.status != .completed)
+            Button("Reveal Source in Finder") {
+                viewModel.revealURL(job.inputURL)
+            }
+            Button("Compare with Original") {
+                viewModel.selectedJobID = job.id
+                viewModel.showSelectedOutputComparison()
+            }
+            .disabled(job.status != .completed)
+            Divider()
+            Button("Remove from Queue") {
+                viewModel.removeJob(job.id)
+            }
+            .disabled(job.status == .running)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var resolvedSettings: CompressionSettings {
+        job.appliedSettings ?? viewModel.settings.resolved(for: job.metadata)
+    }
+
+    private var outputDetail: String {
+        let settings = resolvedSettings
+        var parts: [String] = []
+        if settings.outputPreset.isAudioOnly {
+            parts.append(settings.audioBitrate.displayName)
+        } else if settings.mode == .targetSize {
+            parts.append("fit \(settings.targetSizeMB.formatted(.number.precision(.fractionLength(0...1)))) MB")
+        } else {
+            parts.append(settings.qualityPreset.displayName)
+        }
+        if settings.speedUpSilence {
+            parts.append("silence \(settings.silenceSpeed.displayName)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var mediaSummary: String {
+        guard let metadata = job.metadata else {
+            return job.status == .failed ? "Unreadable" : "Reading"
+        }
+        if metadata.videoCodec == nil {
+            return "\(metadata.audioCodec?.uppercased() ?? "Audio") audio"
+        }
+        let codec = metadata.videoCodec?.uppercased() ?? "Video"
+        if let width = metadata.width, let height = metadata.height {
+            return "\(codec) · \(width)×\(height)"
+        }
+        return codec
+    }
+}
+
+/// The result column: the compressed size once it exists, an honest estimate
+/// before that (the target, or the rendered sample scaled to full length).
+private struct CompressedSizeCell: View {
+    var job: CompressionJob
+    var settings: CompressionSettings
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            if job.status == .completed, let output = job.outputSizeBytes {
+                Text(byteString(output))
+                    .font(AppFont.display(13.5, weight: .bold))
+                    .foregroundStyle(AppColor.ink)
+                Text(savingText(original: job.originalSizeBytes, output: output))
+                    .font(AppFont.text(12))
+                    .foregroundStyle(output <= job.originalSizeBytes ? AppColor.ink3 : AppColor.statusWarning)
+            } else if let estimate {
+                Text("≈ \(byteString(estimate))")
+                    .font(AppFont.text(13))
+                    .foregroundStyle(AppColor.ink3)
+                Text(settings.mode == .targetSize && !settings.outputPreset.isAudioOnly ? "target" : "estimate")
+                    .font(AppFont.text(12))
+                    .foregroundStyle(AppColor.ink4)
+            } else {
+                Text("–")
+                    .font(AppFont.text(13))
+                    .foregroundStyle(AppColor.ink4)
+                    .help("Render a sample in Review to get an estimate.")
+            }
+        }
+        .lineLimit(1)
+    }
+
+    private var estimate: Int64? {
+        guard let metadata = job.metadata else { return nil }
+        if settings.outputPreset.isAudioOnly {
+            // Constant bitrate: size is simply bitrate × duration.
+            return Int64(Double(settings.audioBitrate.rawValue) * 1000 / 8 * metadata.duration)
+        }
+        if settings.mode == .targetSize {
+            return Int64(settings.targetSizeMB * 1024 * 1024)
+        }
+        if job.previewStatus == .ready, let sample = job.previewSizeBytes, sample > 0 {
+            let sampleDuration = min(6, metadata.duration)
+            guard sampleDuration > 0 else { return nil }
+            return Int64(Double(sample) / sampleDuration * metadata.duration)
+        }
+        return nil
+    }
+}
+
+private struct StatusCell: View {
     var job: CompressionJob
 
     var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
-            VStack(alignment: .leading, spacing: 1) {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
                 Text(job.status.displayName)
-                if let errorMessage = job.errorMessage, job.status == .failed || job.status == .cancelled {
-                    Text(errorMessage)
-                        .font(.mono(.caption2))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    .font(AppFont.display(13, weight: .semibold))
+                    .foregroundStyle(job.status == .failed ? AppColor.statusError : AppColor.ink)
+                if job.status == .running {
+                    Spacer(minLength: 4)
+                    Text("\(Int((job.progress * 100).rounded()))%")
+                        .font(AppFont.display(12.5, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(AppColor.ink3)
                 }
+            }
+
+            if job.status == .running {
+                LitProgressBar(value: job.progress)
+            } else if let message = job.errorMessage, job.status == .failed || job.status == .cancelled {
+                Text(message)
+                    .font(AppFont.text(12))
+                    .foregroundStyle(AppColor.ink4)
+                    .lineLimit(1)
+                    .help(message)
             }
         }
     }
 
     private var statusColor: Color {
         switch job.status {
-        case .probing:
-            return .blue
-        case .ready:
-            return .secondary
+        case .probing, .ready:
+            return AppColor.ink4.opacity(0.55)
         case .running:
-            return .brandOrange
+            return AppColor.accent
         case .completed:
-            return .green
+            return AppColor.statusSuccess
         case .failed:
-            return .red
+            return AppColor.statusError
         case .cancelled:
-            return .orange
+            return AppColor.statusWarning
         }
     }
 }
 
-private struct EmptyDropView: View {
-    var isTargeted: Bool
+/// A real sentence and one action. No illustration.
+private struct EmptyQueue: View {
+    var openPanel: () -> Void
 
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "film.stack")
-                .font(.system(size: 46, weight: .regular))
-                .foregroundStyle(isTargeted ? Color.brandOrange : Color.secondary)
-            Text("Drop media here")
-                .font(.title3)
-                .fontWeight(.semibold)
-            Text("Video files compress to MP4 (or your chosen format). Audio files convert to MP3.")
-                .foregroundStyle(.secondary)
+        VStack(spacing: AppMetric.m) {
+            Text("Drop video or audio here")
+                .font(AppFont.display(24, weight: .bold))
+                .tracking(-0.6)
+                .foregroundStyle(AppColor.ink)
+            Text("Files queue up in this list. Video compresses to the format above, audio converts to MP3, and every result is saved next to its original.")
+                .font(AppFont.text(14.5))
+                .foregroundStyle(AppColor.ink3)
+                .multilineTextAlignment(.center)
+                .lineSpacing(3)
+                .frame(maxWidth: 440)
+            Button("Add Media", action: openPanel)
+                .buttonStyle(.lit(.secondary))
+                .padding(.top, 4)
         }
+        .padding(AppMetric.xl)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(isTargeted ? Color.brandOrange : Color.secondary.opacity(0.25), style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
-        )
     }
 }
+
+// MARK: - Action bar
 
 private struct ActionBar: View {
     @EnvironmentObject private var viewModel: AppViewModel
     var openPanel: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Text(viewModel.summaryText)
-                .foregroundStyle(.secondary)
-
-            Spacer()
-
-            Button(action: openPanel) {
-                Label("Add Media", systemImage: "plus")
+        HStack(spacing: AppMetric.s) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(viewModel.summaryText)
+                    .font(AppFont.display(13, weight: .semibold))
+                    .foregroundStyle(AppColor.ink2)
+                if let savings = viewModel.totalSavings {
+                    Text("\(byteString(savings.original)) → \(byteString(savings.output)) · \(savingText(original: savings.original, output: savings.output))")
+                        .font(AppFont.text(12))
+                        .foregroundStyle(AppColor.ink4)
+                }
             }
+            .lineLimit(1)
 
-            Button {
-                viewModel.startCompression()
-            } label: {
-                Label("Review & Start", systemImage: "play.fill")
+            Spacer(minLength: AppMetric.m)
+
+            Button("Remove") {
+                viewModel.removeSelectedJob()
             }
-            .keyboardShortcut(.return, modifiers: .command)
-            .disabled(!viewModel.canStart)
+            .buttonStyle(.lit(.ghost))
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(!viewModel.canRemoveSelected)
+            .help("Remove the selected file from the queue. Nothing on disk is deleted.")
 
-            Button {
-                viewModel.cancelCompression()
-            } label: {
-                Label("Cancel", systemImage: "stop.fill")
+            Button("Clear Completed") {
+                viewModel.clearCompleted()
             }
-            .disabled(!viewModel.canCancel)
+            .buttonStyle(.lit(.ghost))
+            .disabled(viewModel.completedCount == 0 || viewModel.isRunning)
 
-            Button {
+            Button("Reveal Output") {
                 viewModel.revealSelectedOutput()
-            } label: {
-                Label("Reveal Output", systemImage: "folder")
             }
+            .buttonStyle(.lit(.ghost))
             .disabled(!viewModel.canRevealSelectedOutput)
 
-            Button {
+            Button("Compare") {
                 viewModel.showSelectedOutputComparison()
-            } label: {
-                Label("Compare", systemImage: "rectangle.split.2x1")
             }
+            .buttonStyle(.lit(.ghost))
             .disabled(!viewModel.canCompareSelectedOutput)
 
-            Button {
-                viewModel.clearCompleted()
-            } label: {
-                Label("Clear Completed", systemImage: "trash")
-            }
-            .disabled(viewModel.completedCount == 0 || viewModel.isRunning)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-    }
-}
+            Button("Add Media", action: openPanel)
+                .buttonStyle(.lit(.secondary))
+                .keyboardShortcut("o", modifiers: .command)
 
-private struct ComparisonView: View {
-    @EnvironmentObject private var viewModel: AppViewModel
-    var request: ComparisonRequest
-    @State private var selectedFrameIndex = 0
-    @State private var frameZoom = 2.0
-
-    private var job: CompressionJob? {
-        viewModel.jobs.first(where: { $0.id == request.jobID })
-    }
-
-    var body: some View {
-        Group {
-            if let job {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(request.stage == .before ? "Review Compression" : "Compression Result")
-                                .font(.title2)
-                                .fontWeight(.semibold)
-                            Text(job.inputURL.lastPathComponent)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-
-                        Spacer()
-
-                        if !comparisonFrames(for: job).isEmpty {
-                            HStack(spacing: 8) {
-                                Image(systemName: "plus.magnifyingglass")
-                                    .foregroundStyle(.secondary)
-                                    .help("Zoom frames")
-                                Slider(value: $frameZoom, in: 1...4)
-                                    .frame(width: 140)
-                                Text("\(frameZoom, specifier: "%.1f")x")
-                                    .font(.caption)
-                                    .monospacedDigit()
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 34, alignment: .trailing)
-                            }
-                        }
-
-                        Text(comparisonSettings(for: job).outputPreset.shortName)
-                            .font(.headline)
-                    }
-
-                    Group {
-                        if !comparisonFrames(for: job).isEmpty {
-                            FrameComparisonView(
-                                frames: comparisonFrames(for: job),
-                                selectedIndex: $selectedFrameIndex,
-                                zoom: $frameZoom,
-                                compressedTitle: request.stage == .before ? "Compressed Sample" : "Compressed Output"
-                            )
-                        } else {
-                            HStack(spacing: 14) {
-                                VideoPane(
-                                    title: "Original",
-                                    url: job.inputURL,
-                                    placeholder: "Original unavailable"
-                                )
-
-                                VideoPane(
-                                    title: request.stage == .before ? "Compressed Sample" : "Compressed Output",
-                                    url: comparisonVideoURL(for: job),
-                                    placeholder: comparisonPlaceholder(for: job)
-                                )
-                            }
-                        }
-                    }
-                    .frame(height: 330)
-
-                    HStack(alignment: .top, spacing: 14) {
-                        MetricsPanel(title: "Original", rows: originalRows(for: job))
-                        MetricsPanel(title: request.stage == .before ? "Planned Output" : "Actual Output", rows: outputRows(for: job))
-                    }
-
-                    if request.stage == .before, job.previewStatus == .rendering {
-                        ProgressView(value: job.previewProgress) {
-                            Text("Rendering sample")
-                        }
-                    }
-
-                    if request.stage == .before, let errorMessage = job.previewErrorMessage, job.previewStatus == .failed {
-                        Text(errorMessage)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .lineLimit(2)
-                    }
-
-                    HStack {
-                        if request.stage == .before {
-                            Button {
-                                viewModel.renderPreviewSample(for: job.id)
-                            } label: {
-                                Label(job.previewStatus == .ready ? "Refresh Sample" : "Render Sample", systemImage: "play.rectangle")
-                            }
-                            .disabled(job.previewStatus == .rendering || viewModel.isRunning)
-
-                            Spacer()
-
-                            Button("Cancel") {
-                                viewModel.closeComparison()
-                            }
-
-                            Button {
-                                viewModel.startCompressionAfterReview()
-                            } label: {
-                                Label("Start Compression", systemImage: "play.fill")
-                            }
-                            .keyboardShortcut(.return, modifiers: .command)
-                            .disabled(job.previewStatus == .rendering || viewModel.isRunning)
-                        } else {
-                            Spacer()
-
-                            Button {
-                                viewModel.revealURL(job.outputURL)
-                            } label: {
-                                Label("Reveal Output", systemImage: "folder")
-                            }
-
-                            Button("Close") {
-                                viewModel.closeComparison()
-                            }
-                            .keyboardShortcut(.cancelAction)
-                        }
-                    }
+            if viewModel.isRunning {
+                Button("Stop") {
+                    viewModel.cancelCompression()
                 }
-                .padding(18)
-                .frame(minWidth: 920, minHeight: 660)
+                .buttonStyle(.lit(.destructive))
+                .keyboardShortcut(".", modifiers: .command)
             } else {
-                VStack(spacing: 12) {
-                    Text("The selected job is no longer available.")
-                    Button("Close") {
-                        viewModel.closeComparison()
-                    }
+                Button("Review & Start") {
+                    viewModel.startCompression()
                 }
-                .padding(24)
+                .buttonStyle(.lit(.primary))
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(!viewModel.canStart)
             }
         }
-    }
-
-    private func comparisonVideoURL(for job: CompressionJob) -> URL? {
-        switch request.stage {
-        case .before:
-            guard let previewURL = job.previewURL,
-                  FileManager.default.fileExists(atPath: previewURL.path) else {
-                return nil
-            }
-            return previewURL
-        case .after:
-            return FileManager.default.fileExists(atPath: job.outputURL.path) ? job.outputURL : nil
-        }
-    }
-
-    private func comparisonFrames(for job: CompressionJob) -> [ComparisonFrame] {
-        switch request.stage {
-        case .before:
-            return job.previewFrames
-        case .after:
-            return job.outputFrames
-        }
-    }
-
-    private func comparisonPlaceholder(for job: CompressionJob) -> String {
-        switch request.stage {
-        case .before:
-            switch job.previewStatus {
-            case .notRendered:
-                return "Sample not rendered"
-            case .rendering:
-                return "Rendering sample"
-            case .ready:
-                return "Sample unavailable"
-            case .failed:
-                return "Sample failed"
-            }
-        case .after:
-            return "Output unavailable"
-        }
-    }
-
-    private func originalRows(for job: CompressionJob) -> [MetricRow] {
-        [
-            MetricRow("Size", byteString(job.originalSizeBytes)),
-            MetricRow("Video", codecText(job.metadata?.videoCodec)),
-            MetricRow("Resolution", resolutionText(job.metadata)),
-            MetricRow("Audio", audioText(job.metadata)),
-            MetricRow("Duration", durationText(job.metadata?.duration)),
-            MetricRow("Path", job.inputURL.path)
-        ]
-    }
-
-    private func outputRows(for job: CompressionJob) -> [MetricRow] {
-        switch request.stage {
-        case .before:
-            return beforeOutputRows(for: job)
-        case .after:
-            return afterOutputRows(for: job)
-        }
-    }
-
-    private func beforeOutputRows(for job: CompressionJob) -> [MetricRow] {
-        let settings = comparisonSettings(for: job)
-        var rows = [
-            MetricRow("Format", settings.outputPreset.displayName),
-            MetricRow("Video", settings.outputPreset.videoCodecDisplayName),
-            MetricRow("Quality", qualityText(for: job)),
-            MetricRow("Resolution", plannedResolutionText(job.metadata, job: job)),
-            MetricRow("Audio", audioMetricText(for: settings)),
-            MetricRow("Full Output", job.outputURL.path)
-        ]
-
-        if settings.speedUpSilence {
-            rows.insert(MetricRow("Silence", "Quiet parts at \(settings.silenceSpeed.displayName)"), at: rows.count - 1)
-        }
-
-        if job.previewStatus == .ready {
-            rows.insert(MetricRow("Sample Size", byteString(job.previewSizeBytes)), at: 0)
-            rows.insert(MetricRow("Sample Video", codecText(job.previewMetadata?.videoCodec)), at: 2)
-        } else if settings.mode == .targetSize {
-            rows.insert(MetricRow("Target Size", byteString(Int64(settings.targetSizeMB * 1024 * 1024))), at: 0)
-        } else {
-            rows.insert(MetricRow("Estimate", "Render sample"), at: 0)
-        }
-
-        return rows
-    }
-
-    private func afterOutputRows(for job: CompressionJob) -> [MetricRow] {
-        let settings = comparisonSettings(for: job)
-        var rows = [
-            MetricRow("Size", byteString(job.outputSizeBytes)),
-            MetricRow("Video", codecText(job.outputMetadata?.videoCodec)),
-            MetricRow("Resolution", resolutionText(job.outputMetadata)),
-            MetricRow("Audio", audioText(job.outputMetadata)),
-            MetricRow("Duration", durationText(job.outputMetadata?.duration)),
-            MetricRow("Container", containerText(job.outputMetadata)),
-            MetricRow("Preset", settings.outputPreset.displayName),
-            MetricRow("Saved", job.outputURL.path)
-        ]
-        if settings.speedUpSilence {
-            rows.insert(MetricRow("Silence", "Quiet parts at \(settings.silenceSpeed.displayName)"), at: 5)
-        }
-        return rows
-    }
-
-    private func qualityText(for job: CompressionJob) -> String {
-        let settings = comparisonSettings(for: job)
-        if settings.outputPreset.isAudioOnly {
-            return "MP3 \(settings.audioBitrate.displayName)"
-        }
-        switch settings.mode {
-        case .quality:
-            return "\(settings.qualityPreset.displayName), CRF \(settings.crf)"
-        case .targetSize:
-            return "Target \(settings.targetSizeMB.formatted(.number.precision(.fractionLength(0...1)))) MB"
-        }
-    }
-
-    private func plannedResolutionText(_ metadata: MediaMetadata?, job: CompressionJob) -> String {
-        let settings = comparisonSettings(for: job)
-        guard let metadata,
-              let width = metadata.width,
-              let height = metadata.height else {
-            return settings.resolutionCap.displayName
-        }
-
-        guard let maxHeight = settings.resolutionCap.maxHeight, height > maxHeight else {
-            return "\(width)x\(height)"
-        }
-
-        let scaledWidth = max(2, Int((Double(width) * Double(maxHeight) / Double(height)) / 2) * 2)
-        return "\(scaledWidth)x\(maxHeight)"
-    }
-
-    private func comparisonSettings(for job: CompressionJob?) -> CompressionSettings {
-        switch request.stage {
-        case .before:
-            if let previewSettings = job?.previewSettings {
-                return previewSettings
-            }
-            return viewModel.settings.resolved(for: job?.metadata)
-        case .after:
-            return job?.appliedSettings ?? viewModel.settings.resolved(for: job?.metadata)
-        }
+        .padding(.leading, AppMetric.l)
+        .padding(.trailing, AppMetric.s)
+        .frame(height: 52)
+        .litGlass()
     }
 }
 
-private struct FrameComparisonView: View {
-    var frames: [ComparisonFrame]
-    @Binding var selectedIndex: Int
-    @Binding var zoom: Double
-    var compressedTitle: String
+// MARK: - Shared formatting
 
-    private var boundedIndex: Int {
-        guard !frames.isEmpty else { return 0 }
-        return min(max(selectedIndex, 0), frames.count - 1)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 12) {
-                Picker("Frame", selection: $selectedIndex) {
-                    ForEach(Array(frames.enumerated()), id: \.offset) { index, frame in
-                        Text("Frame \(index + 1) - \(durationText(frame.timestamp))").tag(index)
-                    }
-                }
-                .frame(width: 230)
-
-                Spacer()
-            }
-
-            let frame = frames[boundedIndex]
-            HStack(spacing: 14) {
-                FrameImagePane(title: "Original Frame", url: frame.originalURL, zoom: zoom)
-                FrameImagePane(title: compressedTitle, url: frame.compressedURL, zoom: zoom)
-            }
-        }
-        .onAppear(perform: normalizeSelection)
-        .onChange(of: frames) { _ in
-            normalizeSelection()
-        }
-    }
-
-    private func normalizeSelection() {
-        guard !frames.isEmpty else {
-            selectedIndex = 0
-            return
-        }
-        selectedIndex = min(max(selectedIndex, 0), frames.count - 1)
-    }
-}
-
-private struct FrameImagePane: View {
-    var title: String
-    var url: URL
-    var zoom: Double
-    @State private var image: NSImage?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.headline)
-
-            GeometryReader { geometry in
-                ScrollView([.horizontal, .vertical]) {
-                    if let image {
-                        Image(nsImage: image)
-                            .resizable()
-                            .interpolation(.none)
-                            .scaledToFit()
-                            .frame(width: max(geometry.size.width, 1) * zoom)
-                            .frame(minWidth: geometry.size.width, minHeight: geometry.size.height)
-                    } else {
-                        Text("Frame unavailable")
-                            .foregroundStyle(.secondary)
-                            .frame(width: geometry.size.width, height: geometry.size.height)
-                    }
-                }
-                .background(Color(nsColor: .textBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-            }
-        }
-        .onAppear(perform: loadImage)
-        .onChange(of: url) { _ in
-            loadImage()
-        }
-    }
-
-    private func loadImage() {
-        image = NSImage(contentsOf: url)
-    }
-}
-
-private struct VideoPane: View {
-    var title: String
-    var url: URL?
-    var placeholder: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.headline)
-
-            ZStack {
-                Rectangle()
-                    .fill(Color(nsColor: .textBackgroundColor))
-
-                if let url = playableURL {
-                    AppKitVideoPlayer(url: url)
-                } else {
-                    Text(placeholder)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-    }
-
-    private var playableURL: URL? {
-        guard let url, FileManager.default.fileExists(atPath: url.path) else {
-            return nil
-        }
-        return url
-    }
-}
-
-private struct AppKitVideoPlayer: NSViewRepresentable {
-    var url: URL
-
-    final class Coordinator {
-        var url: URL?
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeNSView(context: Context) -> AVPlayerView {
-        let view = AVPlayerView()
-        view.controlsStyle = .floating
-        view.videoGravity = .resizeAspect
-        configure(view, context: context)
-        return view
-    }
-
-    func updateNSView(_ nsView: AVPlayerView, context: Context) {
-        configure(nsView, context: context)
-    }
-
-    private func configure(_ view: AVPlayerView, context: Context) {
-        guard context.coordinator.url != url else { return }
-        view.player?.pause()
-        view.player = AVPlayer(url: url)
-        context.coordinator.url = url
-    }
-
-    static func dismantleNSView(_ nsView: AVPlayerView, coordinator: Coordinator) {
-        nsView.player?.pause()
-        nsView.player = nil
-    }
-}
-
-private struct MetricsPanel: View {
-    var title: String
-    var rows: [MetricRow]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.headline)
-
-            VStack(alignment: .leading, spacing: 7) {
-                ForEach(rows) { row in
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Text(row.label)
-                            .font(.mono(.caption))
-                            .textCase(.uppercase)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 86, alignment: .leading)
-
-                        Text(row.value)
-                            .font(.mono(.caption))
-                            .lineLimit(2)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-    }
-}
-
-private struct MetricRow: Identifiable {
-    let id = UUID()
-    var label: String
-    var value: String
-
-    init(_ label: String, _ value: String) {
-        self.label = label
-        self.value = value
-    }
-}
-
-private func byteString(_ bytes: Int64?) -> String {
+func byteString(_ bytes: Int64?) -> String {
     guard let bytes else { return "Unknown" }
     return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
 }
 
-private func codecText(_ codec: String?) -> String {
-    codec?.uppercased() ?? "Unknown"
+/// "68% smaller" / "12% larger" — a measurement, not an adjective.
+func savingText(original: Int64, output: Int64) -> String {
+    guard original > 0 else { return "" }
+    let change = Double(output - original) / Double(original)
+    let percent = Int((abs(change) * 100).rounded())
+    return output <= original ? "\(percent)% smaller" : "\(percent)% larger"
 }
 
-private func resolutionText(_ metadata: MediaMetadata?) -> String {
-    guard let width = metadata?.width, let height = metadata?.height else {
-        return "Unknown"
-    }
-    return "\(width)x\(height)"
-}
-
-private func audioText(_ metadata: MediaMetadata?) -> String {
-    guard let metadata else { return "Unknown" }
-    return metadata.hasAudio ? codecText(metadata.audioCodec) : "No audio"
-}
-
-private func durationText(_ duration: Double?) -> String {
+func durationText(_ duration: Double?) -> String {
     guard let duration else { return "Unknown" }
-    let minutes = Int(duration) / 60
-    let seconds = Int(duration) % 60
+    let total = Int(duration.rounded())
+    let hours = total / 3600
+    let minutes = (total % 3600) / 60
+    let seconds = total % 60
+    if hours > 0 {
+        return "\(hours):\(String(format: "%02d", minutes)):\(String(format: "%02d", seconds))"
+    }
     return "\(minutes):\(String(format: "%02d", seconds))"
-}
-
-private func audioMetricText(for settings: CompressionSettings) -> String {
-    let codec = settings.outputPreset.isAudioOnly ? "MP3" : "AAC"
-    return "\(codec) \(settings.audioBitrate.displayName)"
-}
-
-private func containerText(_ metadata: MediaMetadata?) -> String {
-    guard let formatName = metadata?.formatName else { return "Unknown" }
-    if formatName.contains("mp4") {
-        return "MP4-compatible"
-    }
-    if formatName.contains("mov") {
-        return "MOV"
-    }
-    return formatName
 }

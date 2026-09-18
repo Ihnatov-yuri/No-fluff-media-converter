@@ -24,11 +24,15 @@ public final class MediaProbeService: @unchecked Sendable {
         process.standardError = error
 
         try process.run()
+
+        // Drain the pipes before waiting: ffprobe blocks once the 64 KB pipe
+        // buffer fills, so waiting first deadlocks on files with many streams.
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let errorData = error.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
 
-        let data = output.fileHandleForReading.readDataToEndOfFile()
         if process.terminationStatus != 0 {
-            let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let stderr = String(data: errorData, encoding: .utf8) ?? ""
             throw CompressionError.processFailed(status: process.terminationStatus, stderr: stderr)
         }
 
@@ -37,7 +41,9 @@ public final class MediaProbeService: @unchecked Sendable {
         }
 
         let probeOutput = try JSONDecoder().decode(FFProbeOutput.self, from: data)
-        let video = probeOutput.streams.first(where: { $0.codecType == "video" })
+        // Cover art in MP3/M4A/FLAC files shows up as a "video" stream flagged
+        // attached_pic. Treating it as video would route music to the MP4 path.
+        let video = probeOutput.streams.first(where: { $0.codecType == "video" && !$0.isAttachedPicture })
         let audio = probeOutput.streams.first(where: { $0.codecType == "audio" })
 
         guard video != nil || audio != nil else {
@@ -79,6 +85,11 @@ private struct FFProbeStream: Decodable {
     var pixelFormat: String?
     var duration: String?
     var frameRate: String?
+    var disposition: [String: Int]?
+
+    var isAttachedPicture: Bool {
+        disposition?["attached_pic"] == 1
+    }
 
     var durationValue: Double? {
         guard let duration else { return nil }
@@ -105,6 +116,7 @@ private struct FFProbeStream: Decodable {
         case pixelFormat = "pix_fmt"
         case duration
         case frameRate = "r_frame_rate"
+        case disposition
     }
 }
 

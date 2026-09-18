@@ -15,7 +15,8 @@ let package = Package(
         .target(name: "VideoCompressorCore"),
         .executableTarget(
             name: "VideoCompressorApp",
-            dependencies: ["VideoCompressorCore"]
+            dependencies: ["VideoCompressorCore"],
+            resources: [.copy("Resources/Fonts")]
         ),
         .executableTarget(
             name: "VideoCompressorChecks",

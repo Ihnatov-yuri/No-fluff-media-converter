@@ -7,6 +7,9 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
+VERSION="0.3.0"
+BUILD="3"
+
 # Cache static ffmpeg/ffprobe binaries between packaging runs
 CACHE_DIR="$ROOT/.build/ffmpeg-cache"
 FFMPEG_URL="https://www.osxexperts.net/ffmpeg711arm.zip"
@@ -50,7 +53,20 @@ fetch_static_binary() {
 fetch_static_binary "ffmpeg" "$FFMPEG_URL"
 fetch_static_binary "ffprobe" "$FFPROBE_URL"
 
-cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
+# Bundled typefaces (Archivo, Schibsted Grotesk), registered at launch
+mkdir -p "$RESOURCES_DIR/Fonts"
+cp "$ROOT"/Sources/VideoCompressorApp/Resources/Fonts/*.ttf "$RESOURCES_DIR/Fonts/"
+
+# App icon, drawn by scripts/make-icon.swift and cached until that script changes
+ICON_CACHE="$ROOT/.build/icon-cache"
+if [ ! -f "$ICON_CACHE/AppIcon.icns" ] || [ "$ROOT/scripts/make-icon.swift" -nt "$ICON_CACHE/AppIcon.icns" ]; then
+    mkdir -p "$ICON_CACHE"
+    swift "$ROOT/scripts/make-icon.swift" "$ICON_CACHE/AppIcon.iconset"
+    iconutil -c icns "$ICON_CACHE/AppIcon.iconset" -o "$ICON_CACHE/AppIcon.icns"
+fi
+cp "$ICON_CACHE/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+
+cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -70,9 +86,29 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>$VERSION</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>$BUILD</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Media</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.movie</string>
+                <string>public.audio</string>
+            </array>
+        </dict>
+    </array>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.video</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
@@ -82,5 +118,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+# Ad-hoc signature over the finished bundle so the resources are sealed and
+# Apple Silicon launches it without complaint.
+codesign --force --deep --sign - "$APP_DIR"
 
 echo "Created $APP_DIR"

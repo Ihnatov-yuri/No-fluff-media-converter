@@ -8,6 +8,8 @@ A small, fast macOS app for compressing video and audio files. No upsells, no te
 - Quality mode (CRF) or target-size mode (two-pass)
 - Optional silence speed-up: quiet stretches (≥1s) play at 2-8x while speech stays at normal pace — great for lectures, meetings, and screen recordings
 - Side-by-side comparison view with frame extraction
+- Original and compressed size side by side in the queue, with an estimate before you start
+- Settings are remembered; drop files on the Dock icon or use Open With
 
 Built with Swift + SwiftUI, wraps `ffmpeg`/`ffprobe`.
 
@@ -57,8 +59,9 @@ Project layout:
 
 - `Sources/VideoCompressorCore` — settings, ffmpeg command building, probing, runner
 - `Sources/VideoCompressorApp` — SwiftUI app, view model, comparison view
+- `Sources/VideoCompressorApp/Theme` — the Lit Field design system (tokens, glass and lift, controls); bundled Archivo and Schibsted Grotesk live in `Resources/Fonts`
 - `Sources/VideoCompressorChecks` — unit + integration checks (runs ffmpeg if available)
-- `scripts/package-app.sh` — builds release and packages the `.app` bundle
+- `scripts/package-app.sh` — builds release and packages the `.app` bundle (icon drawn by `scripts/make-icon.swift`)
 
 ## License
 
