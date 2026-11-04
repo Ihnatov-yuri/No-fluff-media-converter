@@ -30,6 +30,9 @@ public struct FFmpegCommandBuilder: Sendable {
     public var passLogBaseURL: URL?
     public var speedSegments: [SpeedSegment]
     public var scratchDirectoryURL: URL?
+    /// Converts HDR (PQ/HLG) sources to SDR BT.709. Only set it when the ffmpeg
+    /// build has the `zscale` and `tonemap` filters (see `FFmpegCapabilities`).
+    public var toneMapHDR: Bool
 
     public init(
         settings: CompressionSettings,
@@ -38,7 +41,8 @@ public struct FFmpegCommandBuilder: Sendable {
         metadata: MediaMetadata,
         passLogBaseURL: URL? = nil,
         speedSegments: [SpeedSegment] = [],
-        scratchDirectoryURL: URL? = nil
+        scratchDirectoryURL: URL? = nil,
+        toneMapHDR: Bool = false
     ) {
         self.settings = settings
         self.inputURL = inputURL
@@ -47,10 +51,12 @@ public struct FFmpegCommandBuilder: Sendable {
         self.passLogBaseURL = passLogBaseURL
         self.speedSegments = speedSegments
         self.scratchDirectoryURL = scratchDirectoryURL
+        self.toneMapHDR = toneMapHDR
     }
 
     public func build() throws -> CompressionPlan {
         if settings.outputPreset.isAudioOnly {
+            guard metadata.hasAudio else { throw CompressionError.noAudioStream }
             if !speedSegments.isEmpty {
                 return try audioOnlySpeedupPlan()
             }
@@ -71,6 +77,7 @@ public struct FFmpegCommandBuilder: Sendable {
         let effectiveDuration = max(0.1, min(sampleDuration, metadata.duration))
 
         if settings.outputPreset.isAudioOnly {
+            guard metadata.hasAudio else { throw CompressionError.noAudioStream }
             let command = audioOnlyCommand(outputURL: sampleOutputURL, durationLimit: effectiveDuration)
             return CompressionPlan(commands: [command])
         }
@@ -89,7 +96,7 @@ public struct FFmpegCommandBuilder: Sendable {
             arguments += bitrateVideoArguments(videoBitrateKbps: bitrate)
         }
 
-        appendResolutionFilter(to: &arguments)
+        appendVideoFilters(to: &arguments)
         arguments += audioArguments()
         arguments += fastStartArguments()
         arguments += [sampleOutputURL.path]
@@ -118,7 +125,7 @@ public struct FFmpegCommandBuilder: Sendable {
         arguments += videoMap()
         arguments += optionalAudioMap()
         arguments += qualityVideoArguments()
-        appendResolutionFilter(to: &arguments)
+        appendVideoFilters(to: &arguments)
         arguments += audioArguments()
         arguments += fastStartArguments()
         arguments += [outputURL.path]
@@ -134,14 +141,14 @@ public struct FFmpegCommandBuilder: Sendable {
         var firstPass = baseArguments()
         firstPass += videoMap()
         firstPass += bitrateVideoArguments(videoBitrateKbps: videoBitrate)
-        appendResolutionFilter(to: &firstPass)
+        appendVideoFilters(to: &firstPass)
         firstPass += firstPassArguments(passLog: passLog)
 
         var secondPass = baseArguments()
         secondPass += videoMap()
         secondPass += optionalAudioMap()
         secondPass += bitrateVideoArguments(videoBitrateKbps: videoBitrate)
-        appendResolutionFilter(to: &secondPass)
+        appendVideoFilters(to: &secondPass)
         secondPass += secondPassArguments(passLog: passLog)
         secondPass += audioArguments()
         secondPass += fastStartArguments()
@@ -241,11 +248,27 @@ public struct FFmpegCommandBuilder: Sendable {
         )
     }
 
+    /// Frame rates outside this range are almost always a bogus timebase
+    /// reported for variable-frame-rate files, so the CFR pass falls back to 30.
+    static let plausibleFrameRates: ClosedRange<Double> = 1...240
+
     private func cfrNormalizeCommand(outputURL cfrURL: URL) -> FFmpegCommand {
-        let fps = metadata.frameRate ?? 30
+        let fps = metadata.frameRate.flatMap { Self.plausibleFrameRates.contains($0) ? $0 : nil } ?? 30
+        var filter = String(format: "fps=%.6f", fps)
+        if !metadata.hasEvenDimensions {
+            filter += "," + Self.evenDimensionsExpression
+        }
+
         var arguments = baseArguments()
+        // Explicit maps plus -sn/-dn: default stream selection can pull in
+        // subtitle or data tracks the MOV intermediate cannot hold.
+        arguments += videoMap()
+        if metadata.hasAudio {
+            arguments += ["-map", "0:a:0"]
+        }
         arguments += [
-            "-vf", String(format: "fps=%.6f", fps),
+            "-sn", "-dn",
+            "-vf", filter,
             "-c:v", "libx264", "-preset", "fast", "-crf", "16",
             "-video_track_timescale", "90000"
         ]
@@ -262,7 +285,7 @@ public struct FFmpegCommandBuilder: Sendable {
             segments: speedSegments,
             includeVideo: includeVideo,
             includeAudio: includeAudio,
-            scaleFilter: includeVideo ? resolutionScaleExpression() : nil
+            scaleFilter: includeVideo ? videoFilterChain() : nil
         )
         try graph.write(to: url, atomically: true, encoding: .utf8)
     }
@@ -284,8 +307,13 @@ public struct FFmpegCommandBuilder: Sendable {
     }
 
     private func calculatedVideoBitrateKbps(duration: Double) throws -> Int {
-        guard duration > 0 else {
+        guard duration > 0, duration.isFinite else {
             throw CompressionError.invalidDuration
+        }
+        // Settings come from UserDefaults, which can hold anything. Int() traps on
+        // NaN or out-of-range values, so reject them before converting.
+        guard settings.targetSizeMB.isFinite, settings.targetSizeMB > 0, settings.targetSizeMB <= 1_000_000 else {
+            throw CompressionError.targetSizeTooSmall(minimumMB: 1)
         }
 
         let audioKbps = metadata.hasAudio ? settings.audioBitrate.rawValue : 0
@@ -309,9 +337,10 @@ public struct FFmpegCommandBuilder: Sendable {
             "-nostdin",
             "-y",
             "-progress", "pipe:1",
-            "-nostats",
-            "-i", inputPath ?? inputURL.path
+            "-nostats"
         ]
+        arguments += FFmpegInputPolicy.protocolWhitelistArguments
+        arguments += ["-i", inputPath ?? inputURL.path]
         if let durationLimit {
             arguments += ["-t", formattedSeconds(durationLimit)]
         }
@@ -341,6 +370,7 @@ public struct FFmpegCommandBuilder: Sendable {
             "-pix_fmt", "yuv420p"
         ]
         arguments += outputPresetExtraVideoArguments()
+        arguments += colorTagArguments()
         return arguments
     }
 
@@ -352,7 +382,14 @@ public struct FFmpegCommandBuilder: Sendable {
             "-pix_fmt", "yuv420p"
         ]
         arguments += outputPresetExtraVideoArguments()
+        arguments += colorTagArguments()
         return arguments
+    }
+
+    /// Tags tone-mapped output as SDR so players do not treat it as HDR.
+    private func colorTagArguments() -> [String] {
+        guard appliesToneMapping else { return [] }
+        return ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     }
 
     private func outputPresetExtraVideoArguments() -> [String] {
@@ -402,9 +439,34 @@ public struct FFmpegCommandBuilder: Sendable {
         ["-movflags", "+faststart"]
     }
 
-    private func appendResolutionFilter(to arguments: inout [String]) {
-        guard let filter = resolutionScaleExpression() else { return }
+    private func appendVideoFilters(to arguments: inout [String]) {
+        guard let filter = videoFilterChain() else { return }
         arguments += ["-vf", filter]
+    }
+
+    /// 4:2:0 encoders reject odd sizes, so odd sources lose one pixel row/column.
+    public static let evenDimensionsExpression = "scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2"
+
+    private var appliesToneMapping: Bool {
+        toneMapHDR && metadata.isHDR
+    }
+
+    /// Scale (resolution cap, or even-size fix) followed by HDR tone mapping.
+    public func videoFilterChain() -> String? {
+        var filters: [String] = []
+        if let scale = resolutionScaleExpression() {
+            filters.append(scale)
+        } else if !metadata.hasEvenDimensions {
+            filters.append(Self.evenDimensionsExpression)
+        }
+        if appliesToneMapping, let transfer = metadata.colorTransfer {
+            filters.append(
+                "zscale=tin=\(transfer):pin=bt2020:min=bt2020nc:t=linear:npl=100,"
+                    + "format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+                    + "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+            )
+        }
+        return filters.isEmpty ? nil : filters.joined(separator: ",")
     }
 
     private func resolutionScaleExpression() -> String? {

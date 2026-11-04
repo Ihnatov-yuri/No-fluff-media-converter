@@ -10,7 +10,7 @@ public final class MediaProbeService: @unchecked Sendable {
     public func probe(_ inputURL: URL) throws -> MediaMetadata {
         let process = Process()
         process.executableURL = ffprobeURL
-        process.arguments = [
+        process.arguments = FFmpegInputPolicy.protocolWhitelistArguments + [
             "-v", "error",
             "-print_format", "json",
             "-show_format",
@@ -41,6 +41,9 @@ public final class MediaProbeService: @unchecked Sendable {
         }
 
         let probeOutput = try JSONDecoder().decode(FFProbeOutput.self, from: data)
+        if FFmpegInputPolicy.isBlocked(formatName: probeOutput.format?.formatName) {
+            throw CompressionError.unsupportedFormat(probeOutput.format?.formatName?.uppercased() ?? "Playlist")
+        }
         // Cover art in MP3/M4A/FLAC files shows up as a "video" stream flagged
         // attached_pic. Treating it as video would route music to the MP4 path.
         let video = probeOutput.streams.first(where: { $0.codecType == "video" && !$0.isAttachedPicture })
@@ -54,7 +57,7 @@ public final class MediaProbeService: @unchecked Sendable {
             ?? audio?.durationValue
             ?? probeOutput.format?.durationValue
 
-        guard let duration, duration > 0 else {
+        guard let duration, duration.isFinite, duration > 0 else {
             throw CompressionError.invalidDuration
         }
 
@@ -67,7 +70,8 @@ public final class MediaProbeService: @unchecked Sendable {
             height: video?.height,
             pixelFormat: video?.pixelFormat,
             formatName: probeOutput.format?.formatName,
-            frameRate: video?.frameRateValue
+            frameRate: video?.frameRateValue,
+            colorTransfer: video?.colorTransfer
         )
     }
 }
@@ -85,6 +89,8 @@ private struct FFProbeStream: Decodable {
     var pixelFormat: String?
     var duration: String?
     var frameRate: String?
+    var averageFrameRate: String?
+    var colorTransfer: String?
     var disposition: [String: Int]?
 
     var isAttachedPicture: Bool {
@@ -96,9 +102,15 @@ private struct FFProbeStream: Decodable {
         return Double(duration)
     }
 
+    /// Prefers `avg_frame_rate`: on variable-frame-rate sources `r_frame_rate`
+    /// is often a timebase value such as 600/1 or 1000/1.
     var frameRateValue: Double? {
-        guard let frameRate else { return nil }
-        let parts = frameRate.split(separator: "/")
+        Self.rate(from: averageFrameRate) ?? Self.rate(from: frameRate)
+    }
+
+    private static func rate(from text: String?) -> Double? {
+        guard let text else { return nil }
+        let parts = text.split(separator: "/")
         guard parts.count == 2,
               let numerator = Double(parts[0]),
               let denominator = Double(parts[1]),
@@ -116,6 +128,8 @@ private struct FFProbeStream: Decodable {
         case pixelFormat = "pix_fmt"
         case duration
         case frameRate = "r_frame_rate"
+        case averageFrameRate = "avg_frame_rate"
+        case colorTransfer = "color_transfer"
         case disposition
     }
 }

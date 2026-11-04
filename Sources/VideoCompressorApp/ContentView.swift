@@ -50,8 +50,10 @@ struct ContentView: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseFiles = true
-        panel.canChooseDirectories = false
+        // Folders are scanned for media files by the view model.
+        panel.canChooseDirectories = true
         panel.allowedContentTypes = [
+            .folder,
             .audiovisualContent,
             .movie,
             .mpeg4Movie,

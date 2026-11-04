@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 import VideoCompressorCore
 
 @MainActor
@@ -22,7 +23,11 @@ final class AppViewModel: ObservableObject {
     private let ffmpegURL: URL?
     private let ffprobeURL: URL?
     private var activeRunner: CompressionRunner?
+    private var activeDetector: SilenceDetector?
     private var activePreviewRunner: CompressionRunner?
+    private var activeOutputURL: URL?
+    private var isCancelRequested = false
+    private var terminationCompletion: (() -> Void)?
     private var outputFrameGenerationJobIDs = Set<UUID>()
 
     init() {
@@ -47,6 +52,15 @@ final class AppViewModel: ObservableObject {
 
     var canCancel: Bool {
         isRunning
+    }
+
+    /// True while a compression or a preview sample is still encoding.
+    var hasActiveWork: Bool {
+        isRunning || activePreviewRunner != nil
+    }
+
+    private var isTerminating: Bool {
+        terminationCompletion != nil
     }
 
     var canRevealSelectedOutput: Bool {
@@ -90,16 +104,35 @@ final class AppViewModel: ObservableObject {
     }
 
     func addFiles(_ urls: [URL]) {
-        let fileURLs = urls
-            .filter { !$0.hasDirectoryPath }
-            .map { $0.standardizedFileURL }
+        var emptyFolders: [String] = []
+        var fileURLs: [URL] = []
+        for url in urls {
+            if Self.isDirectory(url) {
+                let found = Self.mediaFiles(inFolder: url)
+                if found.isEmpty {
+                    emptyFolders.append(url.lastPathComponent)
+                }
+                fileURLs += found
+            } else {
+                fileURLs.append(url)
+            }
+        }
+        fileURLs = fileURLs.map { $0.standardizedFileURL }
+
+        if !emptyFolders.isEmpty {
+            appError = "No video or audio files found in \(emptyFolders.joined(separator: ", "))."
+        }
 
         for url in fileURLs {
             if jobs.contains(where: { $0.inputURL == url }) {
                 continue
             }
 
-            let outputURL = OutputURLBuilder.compressedOutputURL(for: url, settings: settings)
+            let outputURL = OutputURLBuilder.compressedOutputURL(
+                for: url,
+                settings: settings,
+                reserved: reservedOutputPaths(excluding: nil)
+            )
             let size = fileSize(at: url)
             let job = CompressionJob(inputURL: url, outputURL: outputURL, originalSizeBytes: size)
             jobs.append(job)
@@ -125,20 +158,59 @@ final class AppViewModel: ObservableObject {
     }
 
     func beginCompression() {
-        guard !isRunning else { return }
+        guard !isRunning, !isTerminating else { return }
         guard let ffmpegURL else {
             appError = CompressionError.missingBinary("ffmpeg").localizedDescription
             return
         }
 
+        // Set synchronously so Stop works even before the queue task starts.
+        isRunning = true
+        isCancelRequested = false
         let settingsSnapshot = settings
         Task {
             await runQueue(ffmpegURL: ffmpegURL, settings: settingsSnapshot)
         }
     }
 
+    /// Stops the queue at whatever step it is in: probing, silence detection or encoding.
     func cancelCompression() {
+        guard isRunning else { return }
+        isCancelRequested = true
+        activeDetector?.cancel()
         activeRunner?.cancel()
+    }
+
+    /// Called when the app is about to quit. Stops every ffmpeg process, lets the
+    /// queue delete its partial output, then calls `completion`. Falls back to
+    /// deleting the partial output itself if ffmpeg does not stop within 5 seconds.
+    func stopAllWork(completion: @escaping () -> Void) {
+        terminationCompletion = completion
+        cancelCompression()
+        activePreviewRunner?.cancel()
+
+        // Asynchronous on purpose: the caller must return .terminateLater
+        // before the reply is sent.
+        Task { @MainActor [weak self] in
+            self?.finishTerminationIfIdle()
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            self?.forceFinishTermination()
+        }
+    }
+
+    private func finishTerminationIfIdle() {
+        guard let completion = terminationCompletion, !hasActiveWork else { return }
+        terminationCompletion = nil
+        completion()
+    }
+
+    private func forceFinishTermination() {
+        guard let completion = terminationCompletion else { return }
+        terminationCompletion = nil
+        removePartialOutput(activeOutputURL)
+        completion()
     }
 
     func revealSelectedOutput() {
@@ -162,6 +234,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func renderPreviewSample(for jobID: UUID) {
+        guard !isTerminating else { return }
         guard let ffmpegURL else {
             appError = CompressionError.missingBinary("ffmpeg").localizedDescription
             return
@@ -226,25 +299,38 @@ final class AppViewModel: ObservableObject {
         defer {
             isRunning = false
             activeRunner = nil
-            if let lastCompletedJobID {
+            activeDetector = nil
+            activeOutputURL = nil
+            if isTerminating {
+                finishTerminationIfIdle()
+            } else if let lastCompletedJobID {
                 ensureOutputFrames(for: lastCompletedJobID)
                 comparisonRequest = ComparisonRequest(jobID: lastCompletedJobID, stage: .after)
             }
         }
 
+        let toneMapHDR = await Self.supportsToneMapping(ffmpegURL: ffmpegURL)
+
         let ids = jobs.filter { $0.status.canRun }.map(\.id)
         for id in ids {
+            if isCancelRequested { break }
             guard let inputURL = jobs.first(where: { $0.id == id })?.inputURL else { continue }
             selectedJobID = id
             var startedOutputURL: URL?
 
             do {
                 let metadata = try await metadataForRun(jobID: id)
+                try throwIfCancelRequested()
                 let resolvedSettings = settings.resolved(for: metadata)
-                let outputURL = OutputURLBuilder.compressedOutputURL(for: inputURL, settings: resolvedSettings)
+                let outputURL = OutputURLBuilder.compressedOutputURL(
+                    for: inputURL,
+                    settings: resolvedSettings,
+                    reserved: reservedOutputPaths(excluding: id)
+                )
                 // The builder never reuses an existing name, so anything at this
                 // path after a failure is our own partial file and safe to delete.
                 startedOutputURL = outputURL
+                activeOutputURL = outputURL
                 updateJob(id) {
                     removeFrameFiles($0.outputFrames)
                     $0.metadata = metadata
@@ -253,24 +339,31 @@ final class AppViewModel: ObservableObject {
                     $0.outputSizeBytes = nil
                     $0.appliedSettings = resolvedSettings
                     $0.outputFrames = []
+                    $0.speedSegments = []
                     $0.status = .running
                     $0.progress = 0
                     $0.errorMessage = nil
                 }
 
+                let detector = SilenceDetector(ffmpegURL: ffmpegURL)
+                activeDetector = detector
                 let speedSegments = try await detectSpeedSegments(
                     inputURL: inputURL,
                     metadata: metadata,
                     settings: resolvedSettings,
-                    ffmpegURL: ffmpegURL
+                    detector: detector
                 )
+                activeDetector = nil
+                try throwIfCancelRequested()
+                updateJob(id) { $0.speedSegments = speedSegments }
 
                 let plan = try FFmpegCommandBuilder(
                     settings: resolvedSettings,
                     inputURL: inputURL,
                     outputURL: outputURL,
                     metadata: metadata,
-                    speedSegments: speedSegments
+                    speedSegments: speedSegments,
+                    toneMapHDR: toneMapHDR
                 ).build()
 
                 let runner = CompressionRunner(executableURL: ffmpegURL)
@@ -278,10 +371,13 @@ final class AppViewModel: ObservableObject {
                 try await runner.run(plan: plan) { [weak self] progress in
                     Task { @MainActor in
                         self?.updateJob(id) { job in
+                            // Late updates must not pull a finished job back below 100%.
+                            guard job.status == .running else { return }
                             job.progress = progress
                         }
                     }
                 }
+                activeRunner = nil
 
                 let outputSize = fileSize(at: outputURL)
                 let outputMetadata = try? await probeMetadata(outputURL)
@@ -292,17 +388,23 @@ final class AppViewModel: ObservableObject {
                     $0.outputMetadata = outputMetadata
                     $0.errorMessage = nil
                 }
+                activeOutputURL = nil
                 lastCompletedJobID = id
-            } catch CompressionError.cancelled {
-                removePartialOutput(startedOutputURL)
-                updateJob(id) {
-                    $0.status = .cancelled
-                    $0.progress = 0
-                    $0.errorMessage = CompressionError.cancelled.localizedDescription
-                }
-                break
             } catch {
+                activeRunner = nil
+                activeDetector = nil
+                activeOutputURL = nil
                 removePartialOutput(startedOutputURL)
+                // A stopped ffmpeg can also surface as a non-zero exit, so the
+                // request flag decides, not only the error type.
+                if isCancelRequested || (error as? CompressionError) == .cancelled {
+                    updateJob(id) {
+                        $0.status = .cancelled
+                        $0.progress = 0
+                        $0.errorMessage = CompressionError.cancelled.localizedDescription
+                    }
+                    break
+                }
                 updateJob(id) {
                     $0.status = .failed
                     $0.progress = 0
@@ -310,6 +412,48 @@ final class AppViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func throwIfCancelRequested() throws {
+        if isCancelRequested {
+            throw CompressionError.cancelled
+        }
+    }
+
+    nonisolated private static func supportsToneMapping(ffmpegURL: URL) async -> Bool {
+        await Task.detached(priority: .userInitiated) {
+            FFmpegCapabilities.supportsHDRToneMapping(ffmpegURL: ffmpegURL)
+        }.value
+    }
+
+    /// Output paths promised to queued jobs, so two inputs that share a base
+    /// name (clip.mov, clip.mp4) never show or claim the same output file.
+    private func reservedOutputPaths(excluding id: UUID?) -> Set<String> {
+        Set(jobs.filter { $0.id != id && $0.status != .completed }.map(\.outputURL.path))
+    }
+
+    nonisolated private static func isDirectory(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+    }
+
+    /// Video and audio files inside a dropped folder, including subfolders, in name order.
+    nonisolated private static func mediaFiles(inFolder folder: URL) -> [URL] {
+        guard let enumerator = FileManager.default.enumerator(
+            at: folder,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return []
+        }
+
+        var files: [URL] = []
+        for case let url as URL in enumerator {
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+                  let type = UTType(filenameExtension: url.pathExtension),
+                  type.conforms(to: .audiovisualContent) else { continue }
+            files.append(url)
+        }
+        return files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 
     private func removePartialOutput(_ url: URL?) {
@@ -323,8 +467,12 @@ final class AppViewModel: ObservableObject {
 
     private static func loadSettings() -> CompressionSettings {
         guard let data = UserDefaults.standard.data(forKey: settingsDefaultsKey),
-              let stored = try? JSONDecoder().decode(CompressionSettings.self, from: data) else {
+              var stored = try? JSONDecoder().decode(CompressionSettings.self, from: data) else {
             return .defaults
+        }
+        // Stored values are untrusted: NaN or huge sizes would trap in Int conversions.
+        if !stored.targetSizeMB.isFinite || !(1...100_000).contains(stored.targetSizeMB) {
+            stored.targetSizeMB = CompressionSettings.defaults.targetSizeMB
         }
         return stored
     }
@@ -341,11 +489,10 @@ final class AppViewModel: ObservableObject {
         inputURL: URL,
         metadata: MediaMetadata,
         settings: CompressionSettings,
-        ffmpegURL: URL
+        detector: SilenceDetector
     ) async throws -> [SpeedSegment] {
         guard settings.speedUpSilence, metadata.hasAudio else { return [] }
 
-        let detector = SilenceDetector(ffmpegURL: ffmpegURL)
         let duration = metadata.duration
         let silences = try await Task.detached(priority: .userInitiated) {
             try detector.detectSilences(in: inputURL, mediaDuration: duration)
@@ -410,11 +557,14 @@ final class AppViewModel: ObservableObject {
             try? FileManager.default.removeItem(at: previousPreviewURL)
         }
         removeFrameFiles(previousPreviewFrames)
+        var startedPreviewURL: URL?
 
         do {
             let metadata = try await metadataForRun(jobID: jobID)
             let resolvedSettings = settingsSnapshot.resolved(for: metadata)
             let previewURL = OutputURLBuilder.previewOutputURL(for: inputURL, settings: resolvedSettings)
+            startedPreviewURL = previewURL
+            let toneMapHDR = await Self.supportsToneMapping(ffmpegURL: ffmpegURL)
             updateJob(jobID) {
                 $0.previewSettings = resolvedSettings
             }
@@ -422,14 +572,19 @@ final class AppViewModel: ObservableObject {
                 settings: resolvedSettings,
                 inputURL: inputURL,
                 outputURL: previewURL,
-                metadata: metadata
+                metadata: metadata,
+                toneMapHDR: toneMapHDR
             ).buildSample(outputURL: previewURL)
 
             let runner = CompressionRunner(executableURL: ffmpegURL)
             activePreviewRunner = runner
+            if isTerminating {
+                runner.cancel()
+            }
             try await runner.run(plan: plan) { [weak self] progress in
                 Task { @MainActor in
                     self?.updateJob(jobID) { job in
+                        guard job.previewStatus == .rendering else { return }
                         job.previewProgress = progress
                     }
                 }
@@ -453,12 +608,14 @@ final class AppViewModel: ObservableObject {
                 duration: min(6, metadata.duration)
             )
         } catch CompressionError.cancelled {
+            removePartialOutput(startedPreviewURL)
             updateJob(jobID) {
                 $0.previewStatus = .notRendered
                 $0.previewErrorMessage = nil
                 $0.previewProgress = 0
             }
         } catch {
+            removePartialOutput(startedPreviewURL)
             updateJob(jobID) {
                 $0.previewStatus = .failed
                 $0.previewErrorMessage = error.localizedDescription
@@ -467,6 +624,7 @@ final class AppViewModel: ObservableObject {
         }
 
         activePreviewRunner = nil
+        finishTerminationIfIdle()
     }
 
     private func probeJob(id: UUID) {
@@ -488,17 +646,24 @@ final class AppViewModel: ObservableObject {
             await MainActor.run {
                 switch result {
                 case .success(let metadata):
+                    let reserved = self.reservedOutputPaths(excluding: id)
                     self.updateJob(id) {
                         $0.metadata = metadata
                         $0.status = .ready
                         $0.errorMessage = nil
                         let resolved = self.settings.resolved(for: metadata)
-                        $0.outputURL = OutputURLBuilder.compressedOutputURL(for: $0.inputURL, settings: resolved)
+                        $0.outputURL = OutputURLBuilder.compressedOutputURL(
+                            for: $0.inputURL,
+                            settings: resolved,
+                            reserved: reserved
+                        )
                     }
                 case .failure(let error):
                     self.updateJob(id) {
                         $0.status = .failed
-                        if case CompressionError.processFailed = error {
+                        if case CompressionError.unsupportedFormat = error {
+                            $0.errorMessage = error.localizedDescription
+                        } else if case CompressionError.processFailed = error {
                             $0.errorMessage = "Not a media file FFmpeg can read."
                         } else {
                             $0.errorMessage = error.localizedDescription
@@ -516,9 +681,16 @@ final class AppViewModel: ObservableObject {
 
     private func refreshPendingOutputURLs() {
         guard !isRunning else { return }
+        var reserved = Set<String>()
         for index in jobs.indices where jobs[index].status != .completed && jobs[index].status != .running {
             let resolved = settings.resolved(for: jobs[index].metadata)
-            jobs[index].outputURL = OutputURLBuilder.compressedOutputURL(for: jobs[index].inputURL, settings: resolved)
+            let url = OutputURLBuilder.compressedOutputURL(
+                for: jobs[index].inputURL,
+                settings: resolved,
+                reserved: reserved
+            )
+            jobs[index].outputURL = url
+            reserved.insert(url.path)
         }
     }
 
@@ -552,12 +724,14 @@ final class AppViewModel: ObservableObject {
         duration: Double
     ) {
         Task {
-            let frames = (try? await extractComparisonFrames(
+            let frames = await extractComparisonFrames(
                 ffmpegURL: ffmpegURL,
                 originalURL: originalURL,
                 compressedURL: previewURL,
-                duration: duration
-            )) ?? []
+                duration: duration,
+                speedSegments: [],
+                compressedDuration: nil
+            )
 
             guard let index = jobs.firstIndex(where: { $0.id == jobID }),
                   jobs[index].previewURL == previewURL else {
@@ -575,7 +749,9 @@ final class AppViewModel: ObservableObject {
         ffmpegURL: URL,
         originalURL: URL,
         outputURL: URL,
-        duration: Double
+        duration: Double,
+        speedSegments: [SpeedSegment],
+        outputDuration: Double?
     ) {
         guard !outputFrameGenerationJobIDs.contains(jobID) else { return }
         outputFrameGenerationJobIDs.insert(jobID)
@@ -585,12 +761,14 @@ final class AppViewModel: ObservableObject {
                 outputFrameGenerationJobIDs.remove(jobID)
             }
 
-            let frames = (try? await extractComparisonFrames(
+            let frames = await extractComparisonFrames(
                 ffmpegURL: ffmpegURL,
                 originalURL: originalURL,
                 compressedURL: outputURL,
-                duration: duration
-            )) ?? []
+                duration: duration,
+                speedSegments: speedSegments,
+                compressedDuration: outputDuration
+            )
 
             guard let index = jobs.firstIndex(where: { $0.id == jobID }),
                   jobs[index].outputURL == outputURL else {
@@ -619,36 +797,58 @@ final class AppViewModel: ObservableObject {
             ffmpegURL: ffmpegURL,
             originalURL: job.inputURL,
             outputURL: job.outputURL,
-            duration: duration
+            duration: duration,
+            speedSegments: job.speedSegments,
+            outputDuration: job.outputMetadata?.duration
         )
     }
 
+    /// Extracts matching frame pairs. With silence speed-up the output timeline
+    /// is shorter, so each source time is mapped to its output time. A pair that
+    /// fails is skipped; the others are still returned.
     private func extractComparisonFrames(
         ffmpegURL: URL,
         originalURL: URL,
         compressedURL: URL,
-        duration: Double
-    ) async throws -> [ComparisonFrame] {
-        try await Task.detached(priority: .userInitiated) {
+        duration: Double,
+        speedSegments: [SpeedSegment],
+        compressedDuration: Double?
+    ) async -> [ComparisonFrame] {
+        await Task.detached(priority: .userInitiated) {
             let timestamps = Self.frameTimestamps(duration: duration)
-            return try timestamps.enumerated().map { index, timestamp in
+            return timestamps.enumerated().compactMap { index, timestamp -> ComparisonFrame? in
+                var compressedTimestamp = SilenceSpeedupPlanner.outputTime(
+                    forSourceTime: timestamp,
+                    segments: speedSegments
+                )
+                if let compressedDuration, compressedDuration > 0.1 {
+                    compressedTimestamp = min(compressedTimestamp, compressedDuration - 0.05)
+                }
+                compressedTimestamp = max(0, compressedTimestamp)
+
                 let frameID = UUID().uuidString
                 let directory = URL(fileURLWithPath: NSTemporaryDirectory())
                 let originalFrame = directory.appendingPathComponent("video-compressor-\(frameID)-original-\(index).png")
                 let compressedFrame = directory.appendingPathComponent("video-compressor-\(frameID)-compressed-\(index).png")
 
-                try Self.extractFrame(
-                    ffmpegURL: ffmpegURL,
-                    inputURL: originalURL,
-                    timestamp: timestamp,
-                    outputURL: originalFrame
-                )
-                try Self.extractFrame(
-                    ffmpegURL: ffmpegURL,
-                    inputURL: compressedURL,
-                    timestamp: timestamp,
-                    outputURL: compressedFrame
-                )
+                do {
+                    try Self.extractFrame(
+                        ffmpegURL: ffmpegURL,
+                        inputURL: originalURL,
+                        timestamp: timestamp,
+                        outputURL: originalFrame
+                    )
+                    try Self.extractFrame(
+                        ffmpegURL: ffmpegURL,
+                        inputURL: compressedURL,
+                        timestamp: compressedTimestamp,
+                        outputURL: compressedFrame
+                    )
+                } catch {
+                    try? FileManager.default.removeItem(at: originalFrame)
+                    try? FileManager.default.removeItem(at: compressedFrame)
+                    return nil
+                }
 
                 return ComparisonFrame(
                     originalURL: originalFrame,
@@ -682,6 +882,7 @@ final class AppViewModel: ObservableObject {
             "-loglevel", "error",
             "-y",
             "-ss", String(format: "%.3f", timestamp),
+            "-protocol_whitelist", "file",
             "-i", inputURL.path,
             "-frames:v", "1",
             "-vf", "format=rgb24",

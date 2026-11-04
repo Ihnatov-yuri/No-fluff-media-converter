@@ -298,6 +298,172 @@ enum VideoCompressorChecks {
             try checks.expect(mp3Arguments.containsSequence(["-c:a", "libmp3lame"]))
         }
 
+        try checks.run("odd source dimensions get an even-size scale filter") {
+            var odd = sampleMetadata
+            odd.width = 1281
+            odd.height = 721
+            let plan = try FFmpegCommandBuilder(
+                settings: .defaults,
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: odd
+            ).build()
+            let arguments = plan.commands[0].arguments
+            try checks.expect(arguments.containsSequence(["-vf", FFmpegCommandBuilder.evenDimensionsExpression]))
+
+            let evenPlan = try FFmpegCommandBuilder(
+                settings: .defaults,
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: sampleMetadata
+            ).build()
+            try checks.expect(!evenPlan.commands[0].arguments.contains("-vf"))
+        }
+
+        try checks.run("mp3 export of a file without audio fails clearly") {
+            var silent = sampleMetadata
+            silent.hasAudio = false
+            silent.audioCodec = nil
+            do {
+                _ = try FFmpegCommandBuilder(
+                    settings: CompressionSettings(outputPreset: .mp3),
+                    inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                    outputURL: URL(fileURLWithPath: "/tmp/output.mp3"),
+                    metadata: silent
+                ).build()
+                throw CheckFailure("expected noAudioStream")
+            } catch CompressionError.noAudioStream {
+                return
+            }
+        }
+
+        try checks.run("CFR pass maps streams, drops subtitles and ignores bogus frame rates") {
+            let scratch = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: scratch) }
+
+            var vfr = sampleMetadata
+            vfr.frameRate = 600
+            let plan = try FFmpegCommandBuilder(
+                settings: .defaults,
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: vfr,
+                speedSegments: [
+                    SpeedSegment(start: 0, end: 2, speed: 1),
+                    SpeedSegment(start: 2, end: 5, speed: 4),
+                    SpeedSegment(start: 5, end: 10, speed: 1)
+                ],
+                scratchDirectoryURL: scratch
+            ).build()
+            let cfr = plan.commands[0].arguments
+            try checks.expect(cfr.containsSequence(["-map", "0:v:0"]))
+            try checks.expect(cfr.containsSequence(["-map", "0:a:0"]))
+            try checks.expect(cfr.contains("-sn") && cfr.contains("-dn"))
+            try checks.expect(cfr.contains("fps=30.000000"))
+        }
+
+        try checks.run("source times map onto the sped-up timeline") {
+            let segments = [
+                SpeedSegment(start: 0, end: 2, speed: 1),
+                SpeedSegment(start: 2, end: 6, speed: 4),
+                SpeedSegment(start: 6, end: 10, speed: 1)
+            ]
+            try checks.expect(abs(SilenceSpeedupPlanner.outputTime(forSourceTime: 1, segments: segments) - 1) < 0.001)
+            try checks.expect(abs(SilenceSpeedupPlanner.outputTime(forSourceTime: 4, segments: segments) - 2.5) < 0.001)
+            try checks.expect(abs(SilenceSpeedupPlanner.outputTime(forSourceTime: 8, segments: segments) - 5) < 0.001)
+            try checks.expect(abs(SilenceSpeedupPlanner.outputTime(forSourceTime: 20, segments: segments) - 7) < 0.001)
+            try checks.expect(SilenceSpeedupPlanner.outputTime(forSourceTime: 3, segments: []) == 3)
+        }
+
+        try checks.run("HDR sources are tone mapped only when requested") {
+            var hdr = sampleMetadata
+            hdr.colorTransfer = "smpte2084"
+            hdr.pixelFormat = "yuv420p10le"
+            let mapped = try FFmpegCommandBuilder(
+                settings: .defaults,
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: hdr,
+                toneMapHDR: true
+            ).build().commands[0].arguments
+            try checks.expect(mapped.contains { $0.contains("zscale=tin=smpte2084") && $0.contains("tonemap=") })
+            try checks.expect(mapped.containsSequence(["-color_trc", "bt709"]))
+
+            let untouched = try FFmpegCommandBuilder(
+                settings: .defaults,
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: hdr
+            ).build().commands[0].arguments
+            try checks.expect(!untouched.contains { $0.contains("tonemap") })
+        }
+
+        try checks.run("filter list parser reads ffmpeg -filters output") {
+            let output = """
+            Filters:
+              T.. = Timeline support
+             ... tonemap           V->V       Conversion to/from different dynamic ranges.
+             .SC zscale            V->V       Apply resizing, colorspace and bit depth conversion.
+            """
+            let filters = FFmpegCapabilities.parseFilterList(output)
+            try checks.expect(filters == ["tonemap", "zscale"])
+        }
+
+        try checks.run("output naming skips paths reserved by queued jobs") {
+            let source = URL(fileURLWithPath: "/tmp/\(UUID().uuidString)/clip.mp4")
+            let reserved: Set<String> = [
+                source.deletingLastPathComponent().appendingPathComponent("clip-compressed.mp4").path
+            ]
+            let output = OutputURLBuilder.compressedOutputURL(for: source, reserved: reserved)
+            try checks.expect(output.lastPathComponent == "clip-compressed-2.mp4")
+        }
+
+        try await checks.run("cancel before run is not lost") {
+            let sleepURL = URL(fileURLWithPath: "/bin/sleep")
+            guard FileManager.default.isExecutableFile(atPath: sleepURL.path) else { return }
+
+            let runner = CompressionRunner(executableURL: sleepURL)
+            runner.cancel()
+            do {
+                try await runner.run(plan: CompressionPlan(commands: [FFmpegCommand(arguments: ["5"], duration: 5)])) { _ in }
+                throw CheckFailure("expected cancellation")
+            } catch CompressionError.cancelled {
+                return
+            }
+        }
+
+        try checks.run("inputs are restricted to local files and playlists are blocked") {
+            let arguments = try FFmpegCommandBuilder(
+                settings: .defaults,
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: sampleMetadata
+            ).build().commands[0].arguments
+            let whitelistIndex = arguments.firstIndex(of: "-protocol_whitelist")
+            let inputIndex = arguments.firstIndex(of: "-i")
+            try checks.expect(whitelistIndex != nil && inputIndex != nil && whitelistIndex! < inputIndex!)
+            try checks.expect(arguments.containsSequence(["-protocol_whitelist", "file"]))
+
+            try checks.expect(FFmpegInputPolicy.isBlocked(formatName: "hls"))
+            try checks.expect(FFmpegInputPolicy.isBlocked(formatName: "concat"))
+            try checks.expect(!FFmpegInputPolicy.isBlocked(formatName: "mov,mp4,m4a,3gp,3g2,mj2"))
+            try checks.expect(!FFmpegInputPolicy.isBlocked(formatName: nil))
+        }
+
+        try checks.run("non-finite target size is rejected without trapping") {
+            do {
+                _ = try FFmpegCommandBuilder(
+                    settings: CompressionSettings(mode: .targetSize, targetSizeMB: .nan),
+                    inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                    outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                    metadata: sampleMetadata
+                ).build()
+                throw CheckFailure("expected targetSizeTooSmall")
+            } catch CompressionError.targetSizeTooSmall {
+                return
+            }
+        }
+
         if let tools = requiredTools() {
             try await checks.run("quality compression produces H.264/AAC MP4") {
                 let directory = try makeTemporaryDirectory()
@@ -401,6 +567,91 @@ enum VideoCompressorChecks {
                 try checks.expect(outputMetadata.pixelFormat == "yuv420p")
                 try checks.expect(outputMetadata.formatName?.contains("mp4") == true)
             }
+            try checks.run("probe rejects HLS playlists") {
+                let directory = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+
+                let segment = directory.appendingPathComponent("segment.ts")
+                try generateSyntheticVideo(ffmpeg: tools.ffmpeg, output: segment, duration: 1)
+                let playlist = directory.appendingPathComponent("list.m3u8")
+                try """
+                #EXTM3U
+                #EXT-X-TARGETDURATION:1
+                #EXTINF:1,
+                segment.ts
+                #EXT-X-ENDLIST
+
+                """.write(to: playlist, atomically: true, encoding: .utf8)
+
+                do {
+                    _ = try MediaProbeService(ffprobeURL: tools.ffprobe).probe(playlist)
+                    throw CheckFailure("expected unsupportedFormat")
+                } catch CompressionError.unsupportedFormat {
+                    return
+                }
+            }
+
+            try await checks.run("cancel stops silence detection promptly") {
+                let directory = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+
+                let input = directory.appendingPathComponent("long.wav")
+                try generateSyntheticAudio(ffmpeg: tools.ffmpeg, output: input, duration: 1800)
+
+                let detector = SilenceDetector(ffmpegURL: tools.ffmpeg)
+                let task = Task.detached {
+                    try detector.detectSilences(in: input, mediaDuration: 1800)
+                }
+                try await Task.sleep(nanoseconds: 200_000_000)
+                let cancelledAt = Date()
+                detector.cancel()
+
+                do {
+                    _ = try await task.value
+                    throw CheckFailure("expected cancellation")
+                } catch CompressionError.cancelled {
+                    let elapsed = Date().timeIntervalSince(cancelledAt)
+                    try checks.expect(elapsed < 3, "detection kept running \(elapsed)s after cancel")
+                }
+            }
+
+            try await checks.run("odd-size video compresses in Original resolution") {
+                let directory = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+
+                let input = directory.appendingPathComponent("odd.mov")
+                let output = directory.appendingPathComponent("odd.mp4")
+                try generateSyntheticVideo(ffmpeg: tools.ffmpeg, output: input, duration: 1, size: "321x181", pixelFormat: "yuv444p")
+
+                let metadata = try MediaProbeService(ffprobeURL: tools.ffprobe).probe(input)
+                let plan = try FFmpegCommandBuilder(
+                    settings: .defaults,
+                    inputURL: input,
+                    outputURL: output,
+                    metadata: metadata
+                ).build()
+                try await CompressionRunner(executableURL: tools.ffmpeg).run(plan: plan) { _ in }
+
+                let outputMetadata = try MediaProbeService(ffprobeURL: tools.ffprobe).probe(output)
+                try checks.expect(outputMetadata.width == 320 && outputMetadata.height == 180)
+            }
+
+            try await checks.run("process failure keeps the final stderr lines") {
+                let directory = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+
+                let missing = directory.appendingPathComponent("missing.mov").path
+                let plan = CompressionPlan(commands: [
+                    FFmpegCommand(arguments: ["-hide_banner", "-nostdin", "-i", missing, "-f", "null", "-"], duration: 1)
+                ])
+                do {
+                    try await CompressionRunner(executableURL: tools.ffmpeg).run(plan: plan) { _ in }
+                    throw CheckFailure("expected failure")
+                } catch CompressionError.processFailed(_, let stderr) {
+                    try checks.expect(stderr.contains("missing.mov"), "stderr was: \(stderr)")
+                }
+            }
+
             try await checks.run("silence speedup shortens video with silent middle") {
                 let directory = try makeTemporaryDirectory()
                 defer { try? FileManager.default.removeItem(at: directory) }
@@ -460,13 +711,16 @@ enum VideoCompressorChecks {
             }
 
             try await Task.sleep(nanoseconds: 200_000_000)
+            let cancelledAt = Date()
             runner.cancel()
 
             do {
                 try await task.value
                 throw CheckFailure("expected cancellation")
             } catch CompressionError.cancelled {
-                return
+                // The process must actually stop, not just finish and report cancelled.
+                let elapsed = Date().timeIntervalSince(cancelledAt)
+                try checks.expect(elapsed < 3, "process kept running \(elapsed)s after cancel")
             }
         }
 
@@ -556,19 +810,25 @@ enum VideoCompressorChecks {
         }
     }
 
-    private static func generateSyntheticVideo(ffmpeg: URL, output: URL, duration: Int) throws {
+    private static func generateSyntheticVideo(
+        ffmpeg: URL,
+        output: URL,
+        duration: Int,
+        size: String = "320x180",
+        pixelFormat: String = "yuv420p"
+    ) throws {
         let process = Process()
         process.executableURL = ffmpeg
         process.arguments = [
             "-hide_banner",
             "-y",
             "-f", "lavfi",
-            "-i", "testsrc=size=320x180:rate=30",
+            "-i", "testsrc=size=\(size):rate=30",
             "-f", "lavfi",
             "-i", "sine=frequency=1000:sample_rate=48000",
             "-t", "\(duration)",
             "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", pixelFormat,
             "-c:a", "aac",
             output.path
         ]

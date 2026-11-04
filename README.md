@@ -10,6 +10,8 @@ A small, fast macOS app for compressing video and audio files. No upsells, no te
 - Side-by-side comparison view with frame extraction
 - Original and compressed size side by side in the queue, with an estimate before you start
 - Settings are remembered; drop files on the Dock icon or use Open With
+- Drop a folder to queue every video and audio file inside it
+- HDR (HDR10/HLG) sources are tone mapped to SDR when the bundled FFmpeg has `zscale`
 
 Built with Swift + SwiftUI, wraps `ffmpeg`/`ffprobe`.
 
@@ -40,6 +42,8 @@ cd No-fluff-media-converter
 ./scripts/package-app.sh
 open "dist/Media Compressor.app"
 ```
+
+The packaging script verifies the downloaded `ffmpeg`/`ffprobe` against the SHA-256 pins in `scripts/ffmpeg-binaries.sha256` and refuses to bundle anything that does not match. To pin a new FFmpeg version, verify the binaries, then run once with `PIN_NEW_BINARIES=1 ./scripts/package-app.sh` and commit the updated pin file.
 
 Or run directly via Swift Package Manager:
 

@@ -4,7 +4,8 @@ public enum OutputURLBuilder {
     public static func compressedOutputURL(
         for inputURL: URL,
         settings: CompressionSettings = .defaults,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        reserved: Set<String> = []
     ) -> URL {
         let directory = inputURL.deletingLastPathComponent()
         let baseName = inputURL.deletingPathExtension().lastPathComponent
@@ -12,7 +13,12 @@ public enum OutputURLBuilder {
             .appendingPathComponent("\(baseName)-compressed")
             .appendingPathExtension(settings.outputPreset.fileExtension)
 
-        guard fileManager.fileExists(atPath: initial.path) else {
+        // `reserved` holds paths already promised to other queued jobs.
+        func isTaken(_ url: URL) -> Bool {
+            reserved.contains(url.path) || fileManager.fileExists(atPath: url.path)
+        }
+
+        guard isTaken(initial) else {
             return initial
         }
 
@@ -21,7 +27,7 @@ public enum OutputURLBuilder {
             let candidate = directory
                 .appendingPathComponent("\(baseName)-compressed-\(suffix)")
                 .appendingPathExtension(settings.outputPreset.fileExtension)
-            if !fileManager.fileExists(atPath: candidate.path) {
+            if !isTaken(candidate) {
                 return candidate
             }
             suffix += 1

@@ -25,8 +25,22 @@ struct VideoCompressorApp: App {
                 }
                 .onAppear {
                     let viewModel = viewModel
+                    appDelegate.onShouldTerminate = {
+                        guard viewModel.hasActiveWork else { return .terminateNow }
+                        if viewModel.isRunning {
+                            let alert = NSAlert()
+                            alert.messageText = "Compression is still running"
+                            alert.informativeText = "Quitting stops it and deletes the unfinished output file."
+                            alert.addButton(withTitle: "Quit")
+                            alert.addButton(withTitle: "Keep Compressing")
+                            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+                        }
+                        viewModel.stopAllWork {
+                            NSApp.reply(toApplicationShouldTerminate: true)
+                        }
+                        return .terminateLater
+                    }
                     appDelegate.onTerminate = {
-                        viewModel.cancelCompression()
                         viewModel.removeAllTemporaryFiles()
                     }
                     appDelegate.onOpen = { urls in
@@ -61,6 +75,9 @@ struct VideoCompressorApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Decides whether the app may quit now. Running ffmpeg processes are
+    /// stopped first so no partial output or orphaned process is left behind.
+    var onShouldTerminate: (@MainActor () -> NSApplication.TerminateReply)?
     var onTerminate: (@MainActor () -> Void)?
     /// Files dropped on the Dock icon or sent via "Open With". Anything that
     /// arrives before the window wires itself up waits in `pendingURLs`.
@@ -122,6 +139,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            onShouldTerminate?() ?? .terminateNow
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

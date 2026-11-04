@@ -76,6 +76,21 @@ public enum SilenceSpeedupPlanner {
         segments.reduce(0) { $0 + ($1.end - $1.start) / $1.speed }
     }
 
+    /// Maps a timestamp in the source to the matching timestamp in the sped-up
+    /// output. Returns `sourceTime` unchanged when there are no segments.
+    public static func outputTime(forSourceTime sourceTime: Double, segments: [SpeedSegment]) -> Double {
+        guard !segments.isEmpty else { return sourceTime }
+        var elapsed = 0.0
+        for segment in segments {
+            if sourceTime <= segment.end {
+                let within = max(0, sourceTime - segment.start)
+                return elapsed + within / segment.speed
+            }
+            elapsed += (segment.end - segment.start) / segment.speed
+        }
+        return elapsed
+    }
+
     /// atempo only accepts factors up to 2.0 per instance, so higher speeds chain instances.
     public static func atempoChain(for speed: Double) -> String {
         guard speed > 1.001 else { return "anull" }
@@ -149,9 +164,30 @@ public enum SilenceSpeedupPlanner {
 
 public final class SilenceDetector: @unchecked Sendable {
     private let ffmpegURL: URL
+    private let lock = NSLock()
+    private var currentProcess: Process?
+    private var wasCancelled = false
 
     public init(ffmpegURL: URL) {
         self.ffmpegURL = ffmpegURL
+    }
+
+    /// Stops a running detection pass, which then throws `CompressionError.cancelled`.
+    /// Stays cancelled, so a cancel that lands before detection starts is honoured.
+    public func cancel() {
+        lock.lock()
+        wasCancelled = true
+        let process = currentProcess
+        lock.unlock()
+        if let process {
+            ProcessTermination.stop(process)
+        }
+    }
+
+    private func isCancelled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return wasCancelled
     }
 
     public func detectSilences(
@@ -165,7 +201,10 @@ public final class SilenceDetector: @unchecked Sendable {
         process.arguments = [
             "-hide_banner",
             "-nostdin",
+            "-protocol_whitelist", "file",
             "-i", inputURL.path,
+            // Same track the CFR pass keeps, so detected times match what gets sped up.
+            "-map", "0:a:0",
             "-vn",
             "-af", "silencedetect=noise=\(noiseFloor):d=\(String(format: "%.3f", minimumDuration))",
             "-f", "null",
@@ -176,9 +215,27 @@ public final class SilenceDetector: @unchecked Sendable {
         process.standardOutput = Pipe()
         process.standardError = stderr
 
+        guard !isCancelled() else { throw CompressionError.cancelled }
         try process.run()
+
+        lock.lock()
+        currentProcess = process
+        let cancelledBeforeLaunch = wasCancelled
+        lock.unlock()
+        if cancelledBeforeLaunch {
+            ProcessTermination.stop(process)
+        }
+
         let data = stderr.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+
+        lock.lock()
+        currentProcess = nil
+        lock.unlock()
+
+        if isCancelled() {
+            throw CompressionError.cancelled
+        }
 
         let log = String(data: data, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
