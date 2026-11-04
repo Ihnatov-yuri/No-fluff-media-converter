@@ -7,8 +7,8 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
-VERSION="0.3.0"
-BUILD="3"
+VERSION="0.3.1"
+BUILD="4"
 
 # Cache static ffmpeg/ffprobe binaries between packaging runs
 CACHE_DIR="$ROOT/.build/ffmpeg-cache"
