@@ -201,6 +201,7 @@ public final class SilenceDetector: @unchecked Sendable {
         process.arguments = [
             "-hide_banner",
             "-nostdin",
+            "-protocol_whitelist", "file",
             "-i", inputURL.path,
             // Same track the CFR pass keeps, so detected times match what gets sped up.
             "-map", "0:a:0",

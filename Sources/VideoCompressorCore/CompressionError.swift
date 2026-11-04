@@ -5,6 +5,7 @@ public enum CompressionError: Error, LocalizedError, Equatable {
     case invalidProbeOutput
     case noVideoStream
     case noAudioStream
+    case unsupportedFormat(String)
     case invalidDuration
     case targetSizeTooSmall(minimumMB: Double)
     case processFailed(status: Int32, stderr: String)
@@ -18,6 +19,8 @@ public enum CompressionError: Error, LocalizedError, Equatable {
             return "FFprobe returned output that could not be read."
         case .noVideoStream:
             return "No video stream was found in this file."
+        case .unsupportedFormat(let name):
+            return "\(name) files reference other files and are not supported. Add the media files directly."
         case .noAudioStream:
             return "This file has no audio track, so it cannot be exported as MP3."
         case .invalidDuration:

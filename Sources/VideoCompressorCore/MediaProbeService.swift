@@ -10,7 +10,7 @@ public final class MediaProbeService: @unchecked Sendable {
     public func probe(_ inputURL: URL) throws -> MediaMetadata {
         let process = Process()
         process.executableURL = ffprobeURL
-        process.arguments = [
+        process.arguments = FFmpegInputPolicy.protocolWhitelistArguments + [
             "-v", "error",
             "-print_format", "json",
             "-show_format",
@@ -41,6 +41,9 @@ public final class MediaProbeService: @unchecked Sendable {
         }
 
         let probeOutput = try JSONDecoder().decode(FFProbeOutput.self, from: data)
+        if FFmpegInputPolicy.isBlocked(formatName: probeOutput.format?.formatName) {
+            throw CompressionError.unsupportedFormat(probeOutput.format?.formatName?.uppercased() ?? "Playlist")
+        }
         // Cover art in MP3/M4A/FLAC files shows up as a "video" stream flagged
         // attached_pic. Treating it as video would route music to the MP4 path.
         let video = probeOutput.streams.first(where: { $0.codecType == "video" && !$0.isAttachedPicture })
@@ -54,7 +57,7 @@ public final class MediaProbeService: @unchecked Sendable {
             ?? audio?.durationValue
             ?? probeOutput.format?.durationValue
 
-        guard let duration, duration > 0 else {
+        guard let duration, duration.isFinite, duration > 0 else {
             throw CompressionError.invalidDuration
         }
 

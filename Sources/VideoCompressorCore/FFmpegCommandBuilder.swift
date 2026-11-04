@@ -307,8 +307,13 @@ public struct FFmpegCommandBuilder: Sendable {
     }
 
     private func calculatedVideoBitrateKbps(duration: Double) throws -> Int {
-        guard duration > 0 else {
+        guard duration > 0, duration.isFinite else {
             throw CompressionError.invalidDuration
+        }
+        // Settings come from UserDefaults, which can hold anything. Int() traps on
+        // NaN or out-of-range values, so reject them before converting.
+        guard settings.targetSizeMB.isFinite, settings.targetSizeMB > 0, settings.targetSizeMB <= 1_000_000 else {
+            throw CompressionError.targetSizeTooSmall(minimumMB: 1)
         }
 
         let audioKbps = metadata.hasAudio ? settings.audioBitrate.rawValue : 0
@@ -332,9 +337,10 @@ public struct FFmpegCommandBuilder: Sendable {
             "-nostdin",
             "-y",
             "-progress", "pipe:1",
-            "-nostats",
-            "-i", inputPath ?? inputURL.path
+            "-nostats"
         ]
+        arguments += FFmpegInputPolicy.protocolWhitelistArguments
+        arguments += ["-i", inputPath ?? inputURL.path]
         if let durationLimit {
             arguments += ["-t", formattedSeconds(durationLimit)]
         }

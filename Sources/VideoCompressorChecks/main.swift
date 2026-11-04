@@ -432,6 +432,38 @@ enum VideoCompressorChecks {
             }
         }
 
+        try checks.run("inputs are restricted to local files and playlists are blocked") {
+            let arguments = try FFmpegCommandBuilder(
+                settings: .defaults,
+                inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                metadata: sampleMetadata
+            ).build().commands[0].arguments
+            let whitelistIndex = arguments.firstIndex(of: "-protocol_whitelist")
+            let inputIndex = arguments.firstIndex(of: "-i")
+            try checks.expect(whitelistIndex != nil && inputIndex != nil && whitelistIndex! < inputIndex!)
+            try checks.expect(arguments.containsSequence(["-protocol_whitelist", "file"]))
+
+            try checks.expect(FFmpegInputPolicy.isBlocked(formatName: "hls"))
+            try checks.expect(FFmpegInputPolicy.isBlocked(formatName: "concat"))
+            try checks.expect(!FFmpegInputPolicy.isBlocked(formatName: "mov,mp4,m4a,3gp,3g2,mj2"))
+            try checks.expect(!FFmpegInputPolicy.isBlocked(formatName: nil))
+        }
+
+        try checks.run("non-finite target size is rejected without trapping") {
+            do {
+                _ = try FFmpegCommandBuilder(
+                    settings: CompressionSettings(mode: .targetSize, targetSizeMB: .nan),
+                    inputURL: URL(fileURLWithPath: "/tmp/input.mov"),
+                    outputURL: URL(fileURLWithPath: "/tmp/output.mp4"),
+                    metadata: sampleMetadata
+                ).build()
+                throw CheckFailure("expected targetSizeTooSmall")
+            } catch CompressionError.targetSizeTooSmall {
+                return
+            }
+        }
+
         if let tools = requiredTools() {
             try await checks.run("quality compression produces H.264/AAC MP4") {
                 let directory = try makeTemporaryDirectory()
@@ -535,6 +567,30 @@ enum VideoCompressorChecks {
                 try checks.expect(outputMetadata.pixelFormat == "yuv420p")
                 try checks.expect(outputMetadata.formatName?.contains("mp4") == true)
             }
+            try checks.run("probe rejects HLS playlists") {
+                let directory = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+
+                let segment = directory.appendingPathComponent("segment.ts")
+                try generateSyntheticVideo(ffmpeg: tools.ffmpeg, output: segment, duration: 1)
+                let playlist = directory.appendingPathComponent("list.m3u8")
+                try """
+                #EXTM3U
+                #EXT-X-TARGETDURATION:1
+                #EXTINF:1,
+                segment.ts
+                #EXT-X-ENDLIST
+
+                """.write(to: playlist, atomically: true, encoding: .utf8)
+
+                do {
+                    _ = try MediaProbeService(ffprobeURL: tools.ffprobe).probe(playlist)
+                    throw CheckFailure("expected unsupportedFormat")
+                } catch CompressionError.unsupportedFormat {
+                    return
+                }
+            }
+
             try await checks.run("odd-size video compresses in Original resolution") {
                 let directory = try makeTemporaryDirectory()
                 defer { try? FileManager.default.removeItem(at: directory) }

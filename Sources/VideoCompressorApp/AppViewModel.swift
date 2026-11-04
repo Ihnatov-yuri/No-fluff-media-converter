@@ -467,8 +467,12 @@ final class AppViewModel: ObservableObject {
 
     private static func loadSettings() -> CompressionSettings {
         guard let data = UserDefaults.standard.data(forKey: settingsDefaultsKey),
-              let stored = try? JSONDecoder().decode(CompressionSettings.self, from: data) else {
+              var stored = try? JSONDecoder().decode(CompressionSettings.self, from: data) else {
             return .defaults
+        }
+        // Stored values are untrusted: NaN or huge sizes would trap in Int conversions.
+        if !stored.targetSizeMB.isFinite || !(1...100_000).contains(stored.targetSizeMB) {
+            stored.targetSizeMB = CompressionSettings.defaults.targetSizeMB
         }
         return stored
     }
@@ -657,7 +661,9 @@ final class AppViewModel: ObservableObject {
                 case .failure(let error):
                     self.updateJob(id) {
                         $0.status = .failed
-                        if case CompressionError.processFailed = error {
+                        if case CompressionError.unsupportedFormat = error {
+                            $0.errorMessage = error.localizedDescription
+                        } else if case CompressionError.processFailed = error {
                             $0.errorMessage = "Not a media file FFmpeg can read."
                         } else {
                             $0.errorMessage = error.localizedDescription
@@ -876,6 +882,7 @@ final class AppViewModel: ObservableObject {
             "-loglevel", "error",
             "-y",
             "-ss", String(format: "%.3f", timestamp),
+            "-protocol_whitelist", "file",
             "-i", inputURL.path,
             "-frames:v", "1",
             "-vf", "format=rgb24",
