@@ -591,6 +591,30 @@ enum VideoCompressorChecks {
                 }
             }
 
+            try await checks.run("cancel stops silence detection promptly") {
+                let directory = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: directory) }
+
+                let input = directory.appendingPathComponent("long.wav")
+                try generateSyntheticAudio(ffmpeg: tools.ffmpeg, output: input, duration: 1800)
+
+                let detector = SilenceDetector(ffmpegURL: tools.ffmpeg)
+                let task = Task.detached {
+                    try detector.detectSilences(in: input, mediaDuration: 1800)
+                }
+                try await Task.sleep(nanoseconds: 200_000_000)
+                let cancelledAt = Date()
+                detector.cancel()
+
+                do {
+                    _ = try await task.value
+                    throw CheckFailure("expected cancellation")
+                } catch CompressionError.cancelled {
+                    let elapsed = Date().timeIntervalSince(cancelledAt)
+                    try checks.expect(elapsed < 3, "detection kept running \(elapsed)s after cancel")
+                }
+            }
+
             try await checks.run("odd-size video compresses in Original resolution") {
                 let directory = try makeTemporaryDirectory()
                 defer { try? FileManager.default.removeItem(at: directory) }
@@ -687,13 +711,16 @@ enum VideoCompressorChecks {
             }
 
             try await Task.sleep(nanoseconds: 200_000_000)
+            let cancelledAt = Date()
             runner.cancel()
 
             do {
                 try await task.value
                 throw CheckFailure("expected cancellation")
             } catch CompressionError.cancelled {
-                return
+                // The process must actually stop, not just finish and report cancelled.
+                let elapsed = Date().timeIntervalSince(cancelledAt)
+                try checks.expect(elapsed < 3, "process kept running \(elapsed)s after cancel")
             }
         }
 

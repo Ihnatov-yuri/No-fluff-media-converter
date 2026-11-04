@@ -20,8 +20,8 @@ public final class CompressionRunner: @unchecked Sendable {
         lock.unlock()
         // `currentProcess` is only published after launch, so terminate never
         // hits an unlaunched Process (which raises an exception on macOS).
-        if let process, process.isRunning {
-            process.terminate()
+        if let process {
+            ProcessTermination.stop(process)
         }
     }
 
@@ -93,7 +93,7 @@ public final class CompressionRunner: @unchecked Sendable {
                     let cancelledBeforeLaunch = self.wasCancelled
                     self.lock.unlock()
                     if cancelledBeforeLaunch {
-                        process.terminate()
+                        ProcessTermination.stop(process)
                     }
 
                     process.waitUntilExit()

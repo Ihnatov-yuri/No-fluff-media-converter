@@ -179,8 +179,8 @@ public final class SilenceDetector: @unchecked Sendable {
         wasCancelled = true
         let process = currentProcess
         lock.unlock()
-        if let process, process.isRunning {
-            process.terminate()
+        if let process {
+            ProcessTermination.stop(process)
         }
     }
 
@@ -223,7 +223,7 @@ public final class SilenceDetector: @unchecked Sendable {
         let cancelledBeforeLaunch = wasCancelled
         lock.unlock()
         if cancelledBeforeLaunch {
-            process.terminate()
+            ProcessTermination.stop(process)
         }
 
         let data = stderr.fileHandleForReading.readDataToEndOfFile()
