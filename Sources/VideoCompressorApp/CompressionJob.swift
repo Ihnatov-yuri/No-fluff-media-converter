@@ -105,6 +105,9 @@ struct CompressionJob: Identifiable, Equatable {
     var previewErrorMessage: String?
     var previewFrames: [ComparisonFrame]
     var outputFrames: [ComparisonFrame]
+    /// Silence speed-up segments applied to the output. Maps source times to
+    /// output times for the comparison frames.
+    var speedSegments: [SpeedSegment]
 
     init(inputURL: URL, outputURL: URL, originalSizeBytes: Int64) {
         self.id = UUID()
@@ -127,5 +130,6 @@ struct CompressionJob: Identifiable, Equatable {
         self.previewErrorMessage = nil
         self.previewFrames = []
         self.outputFrames = []
+        self.speedSegments = []
     }
 }

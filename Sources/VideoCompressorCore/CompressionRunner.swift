@@ -10,20 +10,25 @@ public final class CompressionRunner: @unchecked Sendable {
         self.executableURL = executableURL
     }
 
+    /// Stops the running command and every later one. A runner stays cancelled
+    /// once cancelled, so a cancel that lands before `run` starts is never lost.
+    /// Create a new runner for each plan.
     public func cancel() {
         lock.lock()
         wasCancelled = true
         let process = currentProcess
         lock.unlock()
-        process?.terminate()
+        // `currentProcess` is only published after launch, so terminate never
+        // hits an unlaunched Process (which raises an exception on macOS).
+        if let process, process.isRunning {
+            process.terminate()
+        }
     }
 
     public func run(
         plan: CompressionPlan,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws {
-        resetCancellation()
-
         defer {
             cleanup(plan.cleanupURLs)
         }
@@ -81,15 +86,29 @@ public final class CompressionRunner: @unchecked Sendable {
                 }
 
                 do {
+                    try process.run()
+
                     self.lock.lock()
                     self.currentProcess = process
+                    let cancelledBeforeLaunch = self.wasCancelled
                     self.lock.unlock()
+                    if cancelledBeforeLaunch {
+                        process.terminate()
+                    }
 
-                    try process.run()
                     process.waitUntilExit()
 
+                    // Stop the async handlers, then drain whatever is still buffered:
+                    // the final stderr lines usually hold the actual error message.
                     stdout.fileHandleForReading.readabilityHandler = nil
                     stderr.fileHandleForReading.readabilityHandler = nil
+                    outputCollector.appendStdout(
+                        stdout.fileHandleForReading.readDataToEndOfFile(),
+                        duration: command.duration,
+                        progress: progress
+                    )
+                    outputCollector.appendStderr(stderr.fileHandleForReading.readDataToEndOfFile())
+                    outputCollector.flushStdout(duration: command.duration, progress: progress)
 
                     self.lock.lock()
                     self.currentProcess = nil
@@ -124,12 +143,6 @@ public final class CompressionRunner: @unchecked Sendable {
         if isCancelled() {
             throw CompressionError.cancelled
         }
-    }
-
-    private func resetCancellation() {
-        lock.lock()
-        wasCancelled = false
-        lock.unlock()
     }
 
     private func isCancelled() -> Bool {
@@ -207,6 +220,21 @@ private final class ProcessOutputCollector: @unchecked Sendable {
             if let value = CompressionRunner.progressValue(from: line, duration: duration) {
                 progress(value)
             }
+        }
+    }
+
+    /// Parses a final line that arrived without a trailing newline.
+    func flushStdout(
+        duration: Double,
+        progress: @escaping @Sendable (Double) -> Void
+    ) {
+        lock.lock()
+        let line = stdoutRemainder
+        stdoutRemainder = ""
+        lock.unlock()
+
+        if let value = CompressionRunner.progressValue(from: line, duration: duration) {
+            progress(value)
         }
     }
 

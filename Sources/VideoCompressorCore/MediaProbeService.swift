@@ -67,7 +67,8 @@ public final class MediaProbeService: @unchecked Sendable {
             height: video?.height,
             pixelFormat: video?.pixelFormat,
             formatName: probeOutput.format?.formatName,
-            frameRate: video?.frameRateValue
+            frameRate: video?.frameRateValue,
+            colorTransfer: video?.colorTransfer
         )
     }
 }
@@ -85,6 +86,8 @@ private struct FFProbeStream: Decodable {
     var pixelFormat: String?
     var duration: String?
     var frameRate: String?
+    var averageFrameRate: String?
+    var colorTransfer: String?
     var disposition: [String: Int]?
 
     var isAttachedPicture: Bool {
@@ -96,9 +99,15 @@ private struct FFProbeStream: Decodable {
         return Double(duration)
     }
 
+    /// Prefers `avg_frame_rate`: on variable-frame-rate sources `r_frame_rate`
+    /// is often a timebase value such as 600/1 or 1000/1.
     var frameRateValue: Double? {
-        guard let frameRate else { return nil }
-        let parts = frameRate.split(separator: "/")
+        Self.rate(from: averageFrameRate) ?? Self.rate(from: frameRate)
+    }
+
+    private static func rate(from text: String?) -> Double? {
+        guard let text else { return nil }
+        let parts = text.split(separator: "/")
         guard parts.count == 2,
               let numerator = Double(parts[0]),
               let denominator = Double(parts[1]),
@@ -116,6 +125,8 @@ private struct FFProbeStream: Decodable {
         case pixelFormat = "pix_fmt"
         case duration
         case frameRate = "r_frame_rate"
+        case averageFrameRate = "avg_frame_rate"
+        case colorTransfer = "color_transfer"
         case disposition
     }
 }
